@@ -52,11 +52,16 @@ pub struct Cli {
     #[arg(long)]
     pub yes: bool,
 
-    /// Print the plan and stop.
-    #[arg(long)]
-    pub plan_only: bool,
+    /// Plan the change and stop. This is the default when --build is not given.
+    #[arg(short = 'p', long)]
+    pub plan: bool,
 
-    /// Run the full pipeline but never commit, restoring the tree afterwards.
+    /// Apply the plan, verify, review, and commit.
+    #[arg(short = 'b', long)]
+    pub build: bool,
+
+    /// Run the full build pipeline but never commit, restoring the tree afterwards.
+    /// Implies --build.
     #[arg(long)]
     pub dry_run: bool,
 

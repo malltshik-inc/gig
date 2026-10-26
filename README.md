@@ -27,24 +27,37 @@ cargo build --release
 ## Usage
 
 ```sh
-# From the repository you want to change
+# Plan only (default): preflight, baseline, repo map, plan, then stop
 gig "Fix the login timeout bug and make the tests pass"
 
+# Apply, verify, review, and commit
+gig --build "Fix the login timeout bug and make the tests pass"
+
+# Short flags
+gig -b "Fix the login timeout bug and make the tests pass"
+
 # Point at another repository
-gig --dir ../my-project "Add a subtract function to src/math.rs"
+gig --dir ../my-project --build "Add a subtract function to src/math.rs"
 
-# Plan only, no edits
-gig --plan-only "Refactor process_data to return Result"
+# Explicit plan flag (same as the default)
+gig --plan "Refactor process_data to return Result"
 
-# Run the full pipeline, show the diff, then restore the tree
+# Run the build pipeline, show the diff, then restore the tree
 gig --dry-run "..."
 
 # Non-interactive: approve the plan and commit automatically
-gig --yes "..."
+gig --build --yes "..."
 
 # Prompt from stdin
-printf '%s\n' "Fix the failing test in src/auth.rs" | gig --dir .
+printf '%s\n' "Fix the failing test in src/auth.rs" | gig --build --dir .
 ```
+
+### Modes
+
+- **Plan (default):** `gig "..."` or `gig --plan` runs preflight, detection, baseline, repo map, and planning, prints the plan, and exits without touching files.
+- **Build:** `gig --build` applies the plan, verifies, shows the diff, and commits after approval.
+- **Conflict:** passing both `--plan` and `--build` warns and runs in plan mode.
+- `--dry-run` implies `--build` and restores the tree at review.
 
 ### Options
 
@@ -55,9 +68,10 @@ printf '%s\n' "Fix the failing test in src/auth.rs" | gig --dir .
 | `--num-ctx <N>` | `16384` | Context window passed to Ollama |
 | `--max-attempts <N>` | `3` | Edit/verify retries before giving up |
 | `--max-files <N>` | `6` | Maximum files the planner may touch |
-| `--yes` | off | Skip all confirmation prompts |
-| `--plan-only` | off | Print the plan and stop |
-| `--dry-run` | off | Full pipeline, never commit, restore afterwards |
+| `--plan`, `-p` | on | Print the plan and stop (default mode) |
+| `--build`, `-b` | off | Apply the plan, verify, review, and commit |
+| `--yes` | off | Skip all confirmation prompts (use with `--build` to commit automatically) |
+| `--dry-run` | off | Implies `--build`; never commits, restores afterwards |
 | `--no-baseline` | off | Skip the baseline `cargo check`/`cargo test` run |
 | `--verbose` | off | Print raw model requests and responses |
 
@@ -73,6 +87,8 @@ printf '%s\n' "Fix the failing test in src/auth.rs" | gig --dir .
 8. **Verify** — `cargo check` then `cargo test`, with structured Cargo diagnostics and test-failure extraction. Failures are fed back to the editor, up to `--max-attempts`.
 9. **Review** — diff, stat, risk notes, and a commit confirmation.
 10. **Commit** — a generated Conventional Commit message (editable), staging only the files the agent touched.
+
+Plan mode stops after step 6. `--build` continues through step 10; `--dry-run` does the same but restores the tree at step 9.
 
 ## Safety model
 

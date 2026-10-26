@@ -17,8 +17,37 @@ use crate::snapshot::Snapshot;
 use crate::ui;
 use crate::verify::{self, VerifyCommand};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunMode {
+    Plan,
+    Build,
+}
+
+/// Plan mode is the default. `--build` selects build mode, and `--dry-run`
+/// implies build mode. `--plan` always wins; combining it with `--build` is
+/// reported as a conflict.
+pub fn resolve_mode(plan: bool, build: bool, dry_run: bool) -> (RunMode, bool) {
+    let conflict = plan && build;
+    let plan_mode = plan || (!build && !dry_run);
+    let mode = if plan_mode {
+        RunMode::Plan
+    } else {
+        RunMode::Build
+    };
+    (mode, conflict)
+}
+
 pub async fn run(cli: Cli, prompt: String) -> Result<i32> {
     ui::banner();
+
+    let (mode, conflict) = resolve_mode(cli.plan, cli.build, cli.dry_run);
+    if conflict {
+        ui::warn("both --plan and --build were given; planning only");
+    }
+    if cli.plan && cli.dry_run {
+        ui::warn("--dry-run has no effect in plan mode");
+    }
+    let plan_mode = mode == RunMode::Plan;
 
     let client = OllamaClient::new(cli.model.clone(), cli.num_ctx, cli.verbose);
 
@@ -117,7 +146,7 @@ pub async fn run(cli: Cli, prompt: String) -> Result<i32> {
             "the planner needs clarification: {}",
             plan.clarification
         ));
-        if cli.yes || cli.plan_only {
+        if cli.yes || plan_mode {
             ui::info("re-run with a task that answers this question");
             return Ok(2);
         }
@@ -155,8 +184,8 @@ pub async fn run(cli: Cli, prompt: String) -> Result<i32> {
 
     ui::stage("proposed plan");
     ui::print_plan(&plan);
-    if cli.plan_only {
-        ui::info("plan-only mode; no files were changed");
+    if plan_mode {
+        ui::info("plan mode; no files were changed");
         return Ok(0);
     }
     if !ui::confirm("proceed with this plan?", true, cli.yes)? {
@@ -599,4 +628,32 @@ fn slug(value: &str) -> String {
         }
     }
     output.trim_matches('-').chars().take(60).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_is_the_default_mode() {
+        assert_eq!(resolve_mode(false, false, false), (RunMode::Plan, false));
+    }
+
+    #[test]
+    fn build_flag_selects_build_mode() {
+        assert_eq!(resolve_mode(false, true, false), (RunMode::Build, false));
+    }
+
+    #[test]
+    fn dry_run_implies_build_mode() {
+        assert_eq!(resolve_mode(false, false, true), (RunMode::Build, false));
+        assert_eq!(resolve_mode(false, true, true), (RunMode::Build, false));
+    }
+
+    #[test]
+    fn plan_wins_and_reports_conflicts() {
+        assert_eq!(resolve_mode(true, true, false), (RunMode::Plan, true));
+        assert_eq!(resolve_mode(true, false, false), (RunMode::Plan, false));
+        assert_eq!(resolve_mode(true, false, true), (RunMode::Plan, false));
+    }
 }

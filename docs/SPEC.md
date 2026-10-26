@@ -49,7 +49,7 @@ preflight ──► detect ──► baseline ──► repo map
    └─────────────────────────────► commit (LLM message + approval)
 ```
 
-All stages are serial and share a single model. The only loop with model calls is edit → verify.
+All stages are serial and share a single model. The only loop with model calls is edit → verify. Plan mode (the default) stops after the plan gate; `--build` continues through commit.
 
 ## 4. Stages
 
@@ -66,11 +66,21 @@ All stages are serial and share a single model. The only loop with model calls i
 | `--num-ctx <N>` | `16384` | Context window sent to Ollama |
 | `--max-attempts <N>` | `3` | Edit/verify attempts |
 | `--max-files <N>` | `6` | Maximum files the planner may touch |
+| `--plan`, `-p` | on | Print the sanitized plan and exit (default mode) |
+| `--build`, `-b` | off | Apply the plan, verify, review, and commit |
 | `--yes` | off | Skip plan, message, and commit confirmations |
-| `--plan-only` | off | Print the sanitized plan and exit |
-| `--dry-run` | off | Run everything, then restore the tree and exit |
+| `--dry-run` | off | Implies `--build`; restore the tree instead of committing |
 | `--no-baseline` | off | Skip the baseline verification |
 | `--verbose` | off | Print raw model requests and replies |
+
+Mode resolution is deterministic:
+
+- No mode flags: plan mode.
+- `--plan`: plan mode.
+- `--build`: build mode.
+- `--dry-run`: build mode.
+- `--plan` with `--build`: warning, then plan mode.
+- `--plan` with `--dry-run`: plan mode, with a warning that dry-run has no effect.
 
 ### 4.2 Preflight
 
@@ -134,7 +144,7 @@ Rules enforced by the prompt:
 
 If `needs_clarification` is true:
 
-- With `--yes` or `--plan-only`, print the question and exit `2`.
+- With `--yes` or in plan mode, print the question and exit `2`.
 - Otherwise ask one question on stdin, append the answer to the task, and re-plan once. A second clarification request is an error.
 
 ### 4.7 Plan sanitization and gate
@@ -147,7 +157,7 @@ Before display:
 - For existing files, every symbol is normalized and resolved with tree-sitter. Unresolvable symbols are dropped with a warning. A file with no valid symbols is dropped.
 - Duplicate file entries are merged and their symbol lists unioned.
 
-An empty plan is an error. `--plan-only` prints the plan and exits `0`. Otherwise the user confirms; declining exits `2`.
+An empty plan is an error. Plan mode (the default, or `--plan`) prints the plan and exits `0`. In build mode the user confirms; declining exits `2`.
 
 ### 4.8 Editing
 
@@ -204,7 +214,7 @@ After all files are written, files marked format-clean are formatted with `rustf
   - test count dropped (counts `#[test]`, `#[tokio::test`, `#[rstest]`),
   - `Cargo.toml` changed,
   - a file under `tests/` changed.
-- `--dry-run` restores the snapshot and exits `0` before any commit message call.
+- `--dry-run` implies build mode, restores the snapshot, and exits `0` before any commit message call.
 
 ### 4.11 Commit
 
@@ -310,7 +320,7 @@ Log write failures are ignored; logging never aborts a run.
 
 | Code | Meaning |
 | --- | --- |
-| `0` | Success, plan-only, or dry run |
+| `0` | Success, plan mode, or dry run |
 | `1` | Error: preflight, model, I/O, or commit failure |
 | `2` | Aborted by the user or plan rejected |
 | `3` | Verification failed after all attempts |
