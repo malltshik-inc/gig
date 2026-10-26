@@ -179,7 +179,7 @@ pub async fn run(cli: Cli, prompt: String) -> Result<i32> {
     }
 
     plan = agent::sanitize_plan(plan, &pf.root, cli.max_files.max(1))?;
-    if plan.files.is_empty() {
+    if plan.files.is_empty() && plan.renames.is_empty() {
         bail!("the planner produced no actionable edits");
     }
 
