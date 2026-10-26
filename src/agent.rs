@@ -7,6 +7,41 @@ use crate::lang;
 use crate::model::{self, ChatOptions, CommitMessage, Edit, ModelClient, Plan, PlanFile, Rename};
 use crate::ui;
 
+/// Non-Rust files above this size are dropped rather than rewritten whole.
+const MAX_CONFIG_EDIT_BYTES: u64 = 64 * 1024;
+
+/// Common compiled/binary extensions that text edits must never touch.
+fn looks_binary(path: &str) -> bool {
+    let extension = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    matches!(
+        extension.as_str(),
+        "exe"
+            | "dll"
+            | "dylib"
+            | "so"
+            | "bin"
+            | "o"
+            | "obj"
+            | "rlib"
+            | "wasm"
+            | "class"
+            | "jar"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "ico"
+            | "bmp"
+            | "webp"
+            | "pdf"
+            | "zip"
+            | "gz"
+            | "tgz"
+            | "tar"
+            | "7z"
+    )
+}
+
 pub struct PlanContext<'a> {
     pub task: &'a str,
     pub project_name: &'a str,
@@ -26,6 +61,8 @@ Rules:
 - The map is complete. Do not invent files, modules, or symbols that are not listed.
 - Indented symbols belong to the file above them. A `mod tests` block inside a file is not a separate file.
 - For methods use the qualified name, e.g. `Type::method`.
+- Non-Rust files listed in the map (e.g. Cargo.toml) are edited as a whole: list the file with `symbols` empty and describe the change in `intent`.
+- You may create new files, including text files such as `docs/foo.md`, with `create: true` and `symbols` empty.
 - Do not modify tests, CI, or test infrastructure to make a build pass. Never delete or ignore a test.
 - If baseline verification is shown, treat it as the bug to fix. Never change a test's expected value to match broken behavior; the implementation must satisfy the existing tests.
 - Do not add dependencies unless the task cannot be done without one.
@@ -210,6 +247,148 @@ Respond with JSON only."#;
     Ok(edit)
 }
 
+pub struct NewTextFileContext<'a> {
+    pub task: &'a str,
+    pub plan: &'a str,
+    pub file: &'a str,
+    pub diagnostics: &'a str,
+    pub attempt: u32,
+    pub max_attempts: u32,
+}
+
+/// Generate the complete contents of one new non-Rust text file (README,
+/// docs, config, ...). The harness writes `new_code` verbatim.
+pub async fn create_text_file(
+    model: &dyn ModelClient,
+    context: &NewTextFileContext<'_>,
+) -> Result<Edit> {
+    let system = r#"You are the editing stage of gig. You generate the complete contents of one new text file.
+
+You have no tools and no filesystem access. The harness writes your `new_code` string to disk verbatim. Writing the file as text in `new_code` IS creating the file, so never refuse for lack of filesystem access.
+
+Rules:
+- Return the complete contents of the file in new_code.
+- Do not wrap code in markdown fences. Do not add commentary.
+- Match the project's language and style.
+- Your reply is parsed as JSON: escape every `"` inside new_code as `\"`.
+- If you cannot make progress, set give_up to true and explain why in thought.
+Respond with JSON only."#;
+
+    let mut user = format!(
+        "TASK:\n{}\n\nPLAN:\n{}\n\nFILE: {} (new file)\nATTEMPT: {} of {}\n",
+        context.task, context.plan, context.file, context.attempt, context.max_attempts
+    );
+    if !context.diagnostics.trim().is_empty() {
+        user.push_str(&format!(
+            "\nVERIFICATION ERRORS FROM THE PREVIOUS ATTEMPT:\n{}",
+            context.diagnostics
+        ));
+    }
+    user.push_str(&format!(
+        "\nWrite the complete contents of `{}` into new_code.",
+        context.file
+    ));
+
+    let reply = model
+        .chat_json(
+            system,
+            &user,
+            model::editor_schema(),
+            ChatOptions {
+                max_tokens: 4096,
+                temperature: 0.1,
+            },
+        )
+        .await?;
+    let mut edit: Edit = serde_json::from_value(reply.value)
+        .context("the editor returned JSON that does not match the edit schema")?;
+    edit.truncated = reply.truncated;
+    edit.new_code = clean_code(&edit.new_code);
+    if !edit.give_up && edit.new_code.trim().is_empty() {
+        bail!("the editor returned an empty file for `{}`", context.file);
+    }
+    Ok(edit)
+}
+
+pub struct EditExistingFileContext<'a> {
+    pub task: &'a str,
+    pub plan: &'a str,
+    pub file: &'a str,
+    pub current: &'a str,
+    pub diagnostics: &'a str,
+    pub previous: Option<&'a str>,
+    pub attempt: u32,
+    pub max_attempts: u32,
+}
+
+/// For non-Rust files (Cargo.toml, config, docs...) there are no symbols to
+/// target, so the model returns the complete replacement contents.
+pub async fn edit_existing_file(
+    model: &dyn ModelClient,
+    context: &EditExistingFileContext<'_>,
+) -> Result<Edit> {
+    let system = r#"You are the editing stage of gig. You receive one existing file and must return its complete replacement contents.
+
+Rules:
+- Return the ENTIRE file: every line, including the parts that do not change.
+- Preserve formatting, ordering, comments, and unrelated content exactly.
+- Implement only the change described in the task and plan.
+- Do not wrap code in markdown fences. Do not put commentary inside new_code.
+- Your reply is parsed as JSON: escape every `"` inside new_code as `\"`.
+- Set give_up to true only when the required change is genuinely underdetermined.
+Respond with JSON only."#;
+
+    let mut user = format!(
+        "TASK:\n{}\n\nPLAN:\n{}\n\nFILE: {}\nATTEMPT: {} of {}\n\nCURRENT CONTENTS:\n```\n{}\n```",
+        context.task,
+        context.plan,
+        context.file,
+        context.attempt,
+        context.max_attempts,
+        context.current
+    );
+    if !context.diagnostics.trim().is_empty() {
+        user.push_str(&format!(
+            "\n\nVERIFICATION ERRORS FROM THE PREVIOUS ATTEMPT:\n{}",
+            context.diagnostics
+        ));
+    }
+    if let Some(previous) = context.previous
+        && !previous.trim().is_empty()
+    {
+        user.push_str(&format!(
+            "\n\nPREVIOUS REJECTED REPLACEMENT:\n```\n{previous}\n```"
+        ));
+    }
+    user.push_str(&format!(
+        "\n\nReturn the complete updated contents of `{}` in new_code.",
+        context.file
+    ));
+
+    let reply = model
+        .chat_json(
+            system,
+            &user,
+            model::editor_schema(),
+            ChatOptions {
+                max_tokens: 4096,
+                temperature: 0.1,
+            },
+        )
+        .await?;
+    let mut edit: Edit = serde_json::from_value(reply.value)
+        .context("the editor returned JSON that does not match the edit schema")?;
+    edit.truncated = reply.truncated;
+    edit.new_code = clean_code(&edit.new_code);
+    if !edit.give_up && edit.new_code.trim().is_empty() {
+        bail!(
+            "the editor returned an empty replacement for `{}`",
+            context.file
+        );
+    }
+    Ok(edit)
+}
+
 pub async fn commit_message(
     model: &dyn ModelClient,
     task: &str,
@@ -303,12 +482,14 @@ pub fn sanitize_plan(mut plan: Plan, root: &Path, max_files: usize) -> Result<Pl
                 ));
                 continue;
             }
-            if !relative_string.ends_with(".rs") {
+            if !relative_string.ends_with(".rs") && looks_binary(&relative_string) {
                 ui::warn(&format!(
-                    "dropping `{relative_string}`: this build can only create Rust files"
+                    "dropping `{relative_string}`: this build cannot create binary files"
                 ));
                 continue;
             }
+            // New .rs files are linked into the module tree; new text files
+            // are written verbatim.
             files.push(PlanFile {
                 path: relative_string,
                 symbols: Vec::new(),
@@ -323,6 +504,39 @@ pub fn sanitize_plan(mut plan: Plan, root: &Path, max_files: usize) -> Result<Pl
         for rename in &renames {
             source = lang::rename_occurrences(&source, &rename.from, &rename.to)?.0;
         }
+
+        if !relative_string.ends_with(".rs") {
+            // Non-Rust files have no resolvable symbols; the whole file is the
+            // unit of edit. Keep the file when it is small enough.
+            let size = std::fs::metadata(&absolute)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            if size > MAX_CONFIG_EDIT_BYTES {
+                ui::warn(&format!(
+                    "dropping `{relative_string}`: non-Rust files above {} KiB are not editable",
+                    MAX_CONFIG_EDIT_BYTES / 1024
+                ));
+                continue;
+            }
+            let mut symbols = Vec::new();
+            for raw in &file.symbols {
+                let symbol = normalize_symbol(raw);
+                if symbol.is_empty() || rename_sources.contains(&symbol) {
+                    continue;
+                }
+                if !symbols.contains(&symbol) {
+                    symbols.push(symbol);
+                }
+            }
+            files.push(PlanFile {
+                path: relative_string,
+                symbols,
+                intent: file.intent,
+                create: false,
+            });
+            continue;
+        }
+
         let mut valid = Vec::new();
         let mut handled_by_rename = false;
         for raw in &file.symbols {
@@ -578,5 +792,94 @@ mod tests {
         };
         let sanitized = sanitize_plan(plan, dir.path(), 6).unwrap();
         assert!(sanitized.renames.is_empty());
+    }
+
+    #[test]
+    fn sanitize_plan_keeps_cargo_toml_as_a_whole_file_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let plan = Plan {
+            thought: String::new(),
+            needs_clarification: false,
+            clarification: String::new(),
+            plan: String::new(),
+            files: vec![PlanFile {
+                path: "Cargo.toml".to_string(),
+                symbols: vec!["version".to_string()],
+                intent: "bump the version".to_string(),
+                create: false,
+            }],
+            renames: Vec::new(),
+            verification: Vec::new(),
+        };
+        let sanitized = sanitize_plan(plan, dir.path(), 6).unwrap();
+        assert_eq!(sanitized.files.len(), 1);
+        assert_eq!(sanitized.files[0].path, "Cargo.toml");
+        assert!(!sanitized.files[0].create);
+    }
+
+    #[test]
+    fn sanitize_plan_drops_gigantic_non_rust_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big.txt"), vec![b'x'; 100_000]).unwrap();
+        let plan = Plan {
+            thought: String::new(),
+            needs_clarification: false,
+            clarification: String::new(),
+            plan: String::new(),
+            files: vec![PlanFile {
+                path: "big.txt".to_string(),
+                symbols: Vec::new(),
+                intent: "edit".to_string(),
+                create: false,
+            }],
+            renames: Vec::new(),
+            verification: Vec::new(),
+        };
+        let sanitized = sanitize_plan(plan, dir.path(), 6).unwrap();
+        assert!(sanitized.files.is_empty());
+    }
+
+    #[test]
+    fn sanitize_plan_allows_creating_text_files_but_blocks_binaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = Plan {
+            thought: String::new(),
+            needs_clarification: false,
+            clarification: String::new(),
+            plan: String::new(),
+            files: vec![PlanFile {
+                path: "docs/usage.md".to_string(),
+                symbols: Vec::new(),
+                intent: "write docs".to_string(),
+                create: true,
+            }],
+            renames: Vec::new(),
+            verification: Vec::new(),
+        };
+        let sanitized = sanitize_plan(doc, dir.path(), 6).unwrap();
+        assert_eq!(sanitized.files.len(), 1);
+        assert!(sanitized.files[0].create);
+
+        let binary = Plan {
+            thought: String::new(),
+            needs_clarification: false,
+            clarification: String::new(),
+            plan: String::new(),
+            files: vec![PlanFile {
+                path: "tools/app.exe".to_string(),
+                symbols: Vec::new(),
+                intent: "ship binary".to_string(),
+                create: true,
+            }],
+            renames: Vec::new(),
+            verification: Vec::new(),
+        };
+        let sanitized = sanitize_plan(binary, dir.path(), 6).unwrap();
+        assert!(sanitized.files.is_empty());
     }
 }

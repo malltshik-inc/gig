@@ -74,6 +74,17 @@ pub fn build(root: &Path, prompt: &str, max_files: usize) -> Result<RepoMap> {
         });
     }
 
+    // The Cargo.toml manifest is editable as a whole file; list it so the
+    // planner may legally target it for tasks such as version bumps.
+    let manifest = root.join("Cargo.toml");
+    if manifest.is_file() {
+        entries.push(FileEntry {
+            path: "Cargo.toml".to_string(),
+            symbols: Vec::new(),
+            score: i64::MAX,
+        });
+    }
+
     entries.sort_by(|left, right| {
         right
             .score
@@ -231,5 +242,21 @@ mod tests {
 
         let map = build(dir.path(), "fix the login timeout", 5).unwrap();
         assert_eq!(map.files[0].path, "src/auth.rs");
+    }
+
+    #[test]
+    fn lists_the_manifest_for_whole_file_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+
+        let map = build(dir.path(), "bump the version", 5).unwrap();
+        assert_eq!(map.files[0].path, "Cargo.toml");
+        assert!(map.render(1000).contains("Cargo.toml"));
     }
 }

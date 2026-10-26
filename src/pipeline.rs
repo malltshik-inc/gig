@@ -213,6 +213,51 @@ pub async fn run(cli: Cli, prompt: String) -> Result<i32> {
             let relative = Path::new(&file.path);
 
             if file.create {
+                if !file.path.ends_with(".rs") {
+                    // New non-Rust text file: written verbatim, no symbol or
+                    // module-tree handling.
+                    let edit = agent::create_text_file(
+                        &client,
+                        &agent::NewTextFileContext {
+                            task: &task,
+                            plan: &plan.plan,
+                            file: &file.path,
+                            diagnostics: &diagnostics,
+                            attempt,
+                            max_attempts,
+                        },
+                    )
+                    .await?;
+                    log.write_json(
+                        &format!("attempt-{attempt}/create-{}.json", slug(&file.path)),
+                        &edit,
+                    );
+                    if edit.give_up {
+                        failure = Some(format!(
+                            "the editor gave up on {}: {}",
+                            file.path, edit.thought
+                        ));
+                        break 'files;
+                    }
+                    if edit.truncated {
+                        failure = Some(format!(
+                            "the reply for the new file {} was cut off (the model hit the output limit); the file must be complete",
+                            file.path
+                        ));
+                        break 'files;
+                    }
+                    let content = apply_plan_renames(&edit.new_code, &plan.renames)?;
+                    if content.trim().is_empty() {
+                        failure = Some(format!("the new file {} is empty", file.path));
+                        break 'files;
+                    }
+                    snapshot.record(relative)?;
+                    write_file(&pf.root, relative, &content)?;
+                    previous.insert(format!("{}::<file>", file.path), content.clone());
+                    ui::ok(&format!("created {}", file.path));
+                    continue;
+                }
+
                 let edit = agent::edit_new_file(
                     &client,
                     &agent::NewFileContext {
@@ -291,6 +336,57 @@ pub async fn run(cli: Cli, prompt: String) -> Result<i32> {
                         file.path
                     ));
                 }
+                continue;
+            }
+
+            if !file.path.ends_with(".rs") {
+                // Non-Rust files have no symbols to target; the whole file is
+                // the unit of edit.
+                let absolute = pf.root.join(relative);
+                let current = std::fs::read_to_string(&absolute)
+                    .with_context(|| format!("failed to read {}", absolute.display()))?;
+                let key = format!("{}::<file>", file.path);
+                let edit = agent::edit_existing_file(
+                    &client,
+                    &agent::EditExistingFileContext {
+                        task: &task,
+                        plan: &plan.plan,
+                        file: &file.path,
+                        current: &current,
+                        diagnostics: &diagnostics,
+                        previous: previous.get(&key).map(String::as_str),
+                        attempt,
+                        max_attempts,
+                    },
+                )
+                .await?;
+                log.write_json(
+                    &format!("attempt-{attempt}/edit-{}.json", slug(&file.path)),
+                    &edit,
+                );
+                if edit.give_up {
+                    failure = Some(format!(
+                        "the editor gave up on {}: {}",
+                        file.path, edit.thought
+                    ));
+                    break 'files;
+                }
+                if edit.truncated {
+                    failure = Some(format!(
+                        "the replacement for `{}` was cut off (the model hit the output limit); it must contain the complete file",
+                        file.path
+                    ));
+                    break 'files;
+                }
+                let content = apply_plan_renames(&edit.new_code, &plan.renames)?;
+                if content.trim().is_empty() {
+                    failure = Some(format!("the replacement for `{}` is empty", file.path));
+                    break 'files;
+                }
+                snapshot.record(relative)?;
+                write_file(&pf.root, relative, &content)?;
+                previous.insert(key, content.clone());
+                ui::ok(&format!("updated {}", file.path));
                 continue;
             }
 
