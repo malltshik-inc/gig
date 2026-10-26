@@ -19,11 +19,15 @@ fn paint(text: &str, code: &str) -> String {
 
 pub fn banner() {
     println!(
-        "{} {}",
-        paint("gig", "1;36"),
-        paint(concat!("v", env!("CARGO_PKG_VERSION")), "2")
+        "{}\n{}",
+        paint("\
+.d88b  888 .d88b
+8P www  8  8P www
+8b  d8  8  8b  d8
+`Y88P' 888 `Y88P'
+        ", "1;36"),
+        paint(env!("CARGO_PKG_VERSION"), "2")
     );
-    println!("{}", paint("local patch-and-commit agent", "2"));
 }
 
 pub fn stage(title: &str) {
