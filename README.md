@@ -4,6 +4,8 @@
 >
 > This experiment showed that with a small local model (Qwen2.5-Coder 7B), the edit loop repeatedly produced malformed or truncated output — invalid JSON/TOML rewrites and constant upstream aborts ("token repeat limit reached") — so the experience was worse than using a strong model (e.g. DeepSeek V4 Flash) through a capable agent harness. The model quality, not the harness, was the bottleneck, and papering over it did not justify the added complexity.
 
+> See [`docs/SPEC-V2.md`](docs/SPEC-V2.md) for an alternative approach worth considering if this direction is revisited: a cascade of small model contexts, each making one small verified edit and handing off a short `done`/`next`/`hint` note, so a small local model never has to hold a whole task in one context window.
+
 A local patch-and-commit agent for Rust projects. You give it a task; it plans, edits code through tree-sitter, runs `cargo check` and `cargo test`, shows you the diff, and commits only after you approve.
 
 Built for small local models (Qwen2.5-Coder 7B via Ollama) on constrained hardware, not for autonomous cloud agents.
