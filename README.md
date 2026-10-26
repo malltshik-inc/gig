@@ -4,7 +4,7 @@ A local patch-and-commit agent for Rust projects. You give it a task; it plans, 
 
 Built for small local models (Qwen2.5-Coder 7B via Ollama) on constrained hardware, not for autonomous cloud agents.
 
-> `docs/SPEC.md` is the original conversational-agent design. The implementation follows the commit-generator pipeline described here.
+> `docs/SPEC.md` is the implementation specification: architecture, model schemas, safety model, and limits.
 
 ## Requirements
 

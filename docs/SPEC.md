@@ -1,192 +1,356 @@
-# Technical Specification: Local Agentic Developer Assistant (`gig`)
+# Technical Specification: `gig`
 
-## 1. Executive Summary & Core Objectives
+Status: implemented, v0.1.0.
 
-`gig` is a terminal-based AI developer assistant designed to run fully locally using local models (such as `qwen2.5-coder:7b-instruct` via Ollama) on constrained hardware setups (e.g., consumer GPUs with 8 GB VRAM).
+`gig` is a local, non-interactive patch-and-commit agent for Rust projects. You give it a task, a repository, and an Ollama model. It plans the change, applies it through tree-sitter, verifies it with Cargo, shows the diff, and commits only after approval.
 
-The application provides an interactive, terminal user interface (TUI/ratatui) experience similar to OpenCode or Aider, enabling a complete inner-loop development workflow: inspecting project code, executing build and test commands, modifying existing codebases safely, and iterating on compilation failures.
+This document describes the system as built. It replaces the earlier conversational/TUI design; that design remains in git history.
 
-### Key Goals
+## 1. Goals
 
-* **Reliable Local Tool Use:** Bypasses unstructured text tool-calling limitations of small models by leveraging logit-level JSON Schema sampling at the API endpoint.
+- **Run fully locally.** No cloud API, no telemetry, no network calls except to the local Ollama endpoint.
+- **Fit constrained hardware.** One model at a time, serialized stages, default `num_ctx` of 16384, suitable for 8 GB VRAM.
+- **Edit precisely.** Symbol-level replacement through tree-sitter rather than model-generated unified diffs or line numbers.
+- **Fail safely.** The model cannot execute commands; every touched file is snapshotted; a failed attempt is rolled back.
+- **Keep the human in the loop.** A plan gate before edits and a review gate before commit.
 
-* **Precision Code Editing:** Avoids fragile line-number diff calculation (such as standard unified git diffs) by utilizing Abstract Syntax Tree (AST) node parsing and replacement.
+## 2. Non-goals
 
-* **Context Preservation:** Prevents context window exhaustion (staying well under 16k tokens) through aggressive terminal output sanitization and stateless sub-agent context isolation.
+- No TUI, no chat loop, no slash commands, no token-usage status bar.
+- No sub-agent framework. Every stage is a one-shot call; only the editor retries.
+- No model-driven shell execution. The verifier runs a fixed command set.
+- No embeddings or vector store. Retrieval is lexical.
+- No languages other than Rust in this version.
 
-## 2. Core Architectural Principles
-
-### 2.1 Schema-Enforced Structured Generation
-
-Rather than relying on natural language parsing or standard model-driven function calling, `gig` forces Ollama to output valid JSON matching an exact operational schema on every turn. This guarantees that the model produces predictable, executable actions (such as reading a file, replacing a function, or running a command) without emitting raw conversational text or malformed escape sequences.
-
-### 2.2 AST Symbol-Level Code Mutability
-
-Smaller models struggle to maintain precise whitespace and line-offset arithmetic when generating unified diffs (`@@ -x,y +a,b @@`).
-
-`gig` delegates target resolution and patch application to a Tree-Sitter parsing engine:
-
-1. The user/agent specifies a target source file and symbol name (e.g., a function or struct identifier).
-
-2. The harness parses the source file into a Concrete Syntax Tree (CST/AST) and resolves the exact byte bounds of the target symbol.
-
-3. The LLM returns *only* the new source code for that specific node.
-
-4. The harness replaces the old byte range with the new code string and re-parses the file locally to ensure syntax validity before writing to disk.
-
-### 2.3 Sub-Agent Context Isolation & Context Branching
-
-Executing trial-and-error operations (e.g., attempting speculative bug fixes or generating targeted unit tests) directly in the main conversation history quickly degrades model performance due to context bloat.
-
-When a multi-step sub-task or diagnostic fix is needed, the system branches off a lightweight **Sub-Agent**:
-
-* **Fresh Context:** The sub-agent operates with a focused system prompt containing *only* the affected AST symbol and the specific error diagnostic.
-
-* **Bounded Retries:** The sub-agent iterates internally (e.g., max 3 attempts) until the code parses cleanly and tests pass.
-
-* **Summary Rollup:** Once complete (or upon reaching maximum retries), the sub-agent terminates. Its internal conversation history and intermediate raw failure logs are discarded. Only a single high-level summary string is appended to the Main Agent's primary context window.
-
-### 2.4 Diagnostic Output Filtering
-
-Standard build tool outputs (like `cargo test` or compiler backtraces) can span thousands of lines, consuming massive token budgets. `gig` intercepts stdout/stderr streams from local tooling and converts them into structured diagnostics (e.g., parsing structured compiler messages to isolate strictly `error` and `warning` levels, or extracting panic locations), feeding only clean, condensed error summaries back to the LLM.
-
-## 3. System Components & Data Flow
+## 3. Pipeline
 
 ```
-                     ┌──────────────────────────────────────┐
-                     │          TUI / Terminal Loop         │
-                     │  (Interactive Input, Log Output)     │
-                     └──────────────────┬───────────────────┘
-                                        │ User Task Input
-                                        ▼
-                     ┌──────────────────────────────────────┐
-                     │              Main Agent              │
-                     │  (Main History & Operational Loop)   │
-                     └──────────────────┬───────────────────┘
-                                        │
-           ┌────────────────────────────┼────────────────────────────┐
-           ▼                            ▼                            ▼
-┌─────────────────────┐      ┌────────────────────┐       ┌────────────────────┐
-│   Ollama Client     │      │   AST Engine       │       │ Command Executor   │
-│  (JSON API Driver)  │      │   (Tree-Sitter)    │       │ (Process Runner)   │
-└─────────────────────┘      └────────────────────┘       └────────────────────┘
-                                        │
-                                 Delegate Fix/Test
-                                        ▼
-                     ┌──────────────────────────────────────┐
-                     │        Sub-Agent Task Runner         │
-                     │ (Isolated Context Branch & Retries)  │
-                     └──────────────────────────────────────┘
+CLI prompt
+   │
+   ▼
+preflight ──► detect ──► baseline ──► repo map
+   │                                   │
+   │                                   ▼
+   │                                 plan ──► clarification? ──► re-plan (once)
+   │                                   │
+   │                                   ▼
+   │                              plan gate (human)
+   │                                   │
+   │                                   ▼
+   │                          edit loop (LLM, per symbol)
+   │                                   │
+   │                                   ▼
+   │                             verify (cargo check, cargo test)
+   │                                   │ fail ──► rollback, retry
+   │                                   ▼
+   │                             review gate (human, diff)
+   │                                   │
+   │                                   ▼
+   └─────────────────────────────► commit (LLM message + approval)
 ```
 
-## 4. Detailed Component Design & Responsibilities
+All stages are serial and share a single model. The only loop with model calls is edit → verify.
 
-### 4.1 Terminal User Interface (TUI)
+## 4. Stages
 
-* **User Experience:** Provides a multi-pane console application. Features an active conversation view, a live execution/log viewer, and a status bar indicating current LLM token usage and sub-agent state.
+### 4.1 CLI and input
 
-* **Input Routing:** Captures user prompts and forwards them to the Main Agent event loop. Supports slash commands (e.g., `/reset`, `/run`, `/quit`).
+- Task prompt comes from positional arguments (joined with spaces) or stdin when no arguments are given and stdin is not a terminal.
+- An empty prompt is an error.
+- The repository defaults to the current directory.
 
-### 4.2 Main Agent Event Loop & State Machine
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--dir <PATH>` | `.` | Repository directory |
+| `--model <NAME>` | `qwen2.5-coder:7b-instruct` | Ollama model |
+| `--num-ctx <N>` | `16384` | Context window sent to Ollama |
+| `--max-attempts <N>` | `3` | Edit/verify attempts |
+| `--max-files <N>` | `6` | Maximum files the planner may touch |
+| `--yes` | off | Skip plan, message, and commit confirmations |
+| `--plan-only` | off | Print the sanitized plan and exit |
+| `--dry-run` | off | Run everything, then restore the tree and exit |
+| `--no-baseline` | off | Skip the baseline verification |
+| `--verbose` | off | Print raw model requests and replies |
 
-* **State Management:** Manages the primary conversation history stack.
+### 4.2 Preflight
 
-* **Action Resolution:** Receives structured JSON responses from Ollama and dispatches tasks to the appropriate sub-system:
+Deterministic; the only Ollama request is the model availability check.
 
-  * **File Read:** Reads target file content and appends it to context.
+1. `git --version` must succeed.
+2. The directory is canonicalized and resolved to the repository toplevel with `git rev-parse --show-toplevel`.
+3. `git status --porcelain` must contain no tracked modifications or staged changes. Untracked files (`??`) are allowed.
+4. `HEAD` is checked with `git rev-parse --verify --quiet HEAD`. An unborn HEAD is allowed; rollback uses snapshots, not git.
+5. The current branch and absolute git directory are recorded.
+6. Missing `user.name` / `user.email` produces a warning, not a failure.
+7. The configured model must appear in Ollama's `/api/tags` list. Missing models produce the installed list and a `ollama pull` hint.
 
-  * **AST Symbol Replacement:** Invokes the AST Engine to modify code.
+### 4.3 Project detection
 
-  * **Command Execution:** Triggers shell operations via the Command Executor.
+- Rust only: `Cargo.toml` must exist at the repository root.
+- The package `name` and `edition` are read from the `[package]` table with a line-oriented parser. Missing edition falls back to `2021`.
+- Absence of `Cargo.toml` is a hard error with a "Rust/Cargo only" message.
 
-  * **Spawn Sub-Agent:** Offloads a speculative fix or diagnostic task to a child runner.
+### 4.4 Baseline verification
 
-  * **Task Completion:** Summarizes work completed and returns control to the user.
+Runs on the clean tree before planning:
 
-### 4.3 Ollama API Client
+- `cargo check --message-format=json`
+- `cargo test --quiet`
 
-* **HTTP Transport:** Handles asynchronous communication with Ollama's endpoints (`/api/chat`).
+Both must pass for a green baseline. A red baseline is not fatal: the structured summary is passed to the planner so pre-existing failures are visible. Because the final gate requires both commands to pass, a red baseline effectively means "fix everything."
 
-* **Schema Injection:** Injects the strict JSON format payload on every request, ensuring zero plain-text fallback responses.
+`--no-baseline` replaces the summary with `(skipped)`.
 
-* **Runtime Options:** Hardcodes inference options suitable for precise code manipulation:
+### 4.5 Repository map
 
-  * Low temperature (`0.0` to `0.1`) for deterministic code generation.
+- Walk with the `ignore` crate: hidden files and gitignored paths (`.gitignore`, global gitignore, git excludes) are skipped; files over 1 MB are skipped.
+- Only `.rs` files outside `target/` are indexed.
+- Each file is parsed with tree-sitter; the index records qualified symbol names and kinds.
+- Lexical scoring per task token:
+  - path contains token: `+8`
+  - symbol name equals token: `+30`
+  - symbol name contains token: `+12`
+  - qualified name contains token: `+4`
+  - path depth penalty: `-1` per `/`
+- The top 400 files are kept; the renderer truncates to 12,000 characters.
+- Rendering is file-oriented, one symbol per line with its kind, and states that indented symbols belong to the file above them.
 
-  * Expanded context window limit (`num_ctx: 16384` or `32768`).
+### 4.6 Planning
 
-### 4.4 AST Engine (Tree-Sitter)
+One schema-constrained Ollama call.
 
-* **Symbol Resolution:** Parses source files for target programming languages (e.g., Rust) and locates specific functions, methods, or struct definitions by identifier name.
+Inputs: task, project name/language/edition, `--max-files`, baseline summary, rendered repo map.
 
-* **Byte-Range Replacement:** Calculates exact start and end byte indices for target nodes and substitutes updated code generated by the LLM.
+Rules enforced by the prompt:
 
-* **Pre-Validation Guard:** Automatically parses the newly constructed file string *before* saving changes to disk. If Tree-Sitter reports syntax errors (`has_error`), the edit is rejected immediately, preventing corrupt code from reaching the filesystem.
+- Touch the fewest files possible; prefer editing existing symbols.
+- Use only paths and symbols present in the map, unless creating a new file.
+- The map is complete; do not invent files, modules, or symbols.
+- Do not modify tests, CI, or test infrastructure; never delete or ignore a test.
+- If the baseline is red, treat it as the bug; never change a test's expected value to match broken behavior.
+- Do not add dependencies unless unavoidable.
+- Ask for clarification only when no listed symbol could plausibly satisfy the task.
+- Leave `verification` empty; the harness chooses commands.
 
-### 4.5 Command Executor & Output Sanitizer
+If `needs_clarification` is true:
 
-* **Command Dispatch:** Runs shell commands (e.g., `cargo test`, `cargo check`, `git status`) in subprocesses asynchronously.
+- With `--yes` or `--plan-only`, print the question and exit `2`.
+- Otherwise ask one question on stdin, append the answer to the task, and re-plan once. A second clarification request is an error.
 
-* **Log Pruning:** Captures command output streams and filters them:
+### 4.7 Plan sanitization and gate
 
-  * Intercepts standard compiler error streams.
+Before display:
 
-  * Filters out passing test assertions, environment setup logs, and clean compile lines.
+- Paths are normalized: backslashes become `/`, absolute paths and `..` are rejected, and existing paths must canonicalize inside the repository root.
+- Files beyond `--max-files` are dropped.
+- A nonexistent file is kept only if `create` is true and the path ends in `.rs`.
+- For existing files, every symbol is normalized and resolved with tree-sitter. Unresolvable symbols are dropped with a warning. A file with no valid symbols is dropped.
+- Duplicate file entries are merged and their symbol lists unioned.
 
-  * Retains only actionable compiler diagnostics (file path, line/column, error code, and error message).
+An empty plan is an error. `--plan-only` prints the plan and exits `0`. Otherwise the user confirms; declining exits `2`.
 
-### 4.6 Sub-Agent Task Engine
+### 4.8 Editing
 
-* **Context Creation:** Instantiates a minimal message array containing a specialized system prompt, the raw target symbol code, and the sanitized compiler error.
+Attempts run from `1` to `--max-attempts`. Each attempt walks the plan's files in order.
 
-* **Isolation Loop:** Executes an internal loop allowing the sub-agent to propose fixes, run AST checks, and trigger test executions.
+**New files**
 
-* **Self-Correction:** If a proposed edit fails AST validation or causes a new build error, the failure is appended *only* to the sub-agent's local context array for a second or third retry turn.
+- One model call returns the complete file contents.
+- The response is checked with tree-sitter; any syntax error rejects the attempt.
+- The file is written, then linked into the module tree deterministically:
+  - `src/foo.rs` → `mod foo;` in `src/lib.rs`, else `src/main.rs`.
+  - `src/a/b.rs` → `mod b;` in `src/a.rs`, else `src/a/mod.rs`.
+  - `src/a/mod.rs` → `mod a;` in the parent module.
+  - `src/lib.rs`, `src/main.rs`, and `src/bin/*` are not linked.
+- The declaration is inserted only when absent, using the same import-insertion path as `use` lines. The parent file is snapshotted and appears in the diff.
+- A created file under `src/` that is not a crate root and has no resolvable parent produces a warning.
 
-* **Teardown & Rollup:** Upon reaching a passing state or exhausting max retries, the sub-agent context array is completely deallocated. A concise text result is returned back to the Main Agent.
+**Existing symbols**
 
-## 5. API Schema Specification
+- The symbol is re-resolved against the current file contents.
+- The model receives the task, plan, file, qualified symbol, kind, attempt number, current symbol (including attributes and doc comments), file context, prior diagnostics, and the previous rejected replacement.
+- File context is the whole file when it is at most 12,000 bytes; otherwise the 60 lines before the symbol, truncated to 3,000 characters from the end.
+- The replacement is cleaned of markdown fences, stripped of duplicated attribute/doc lines, dedented, and re-indented to the symbol's indentation.
+- The old node's line range is replaced. Attributes and doc comments immediately above the node are outside that range and preserved.
+- New `use` lines and `mod name;` declarations are inserted after the last existing `use`, inner attribute, or inner doc comment (`//!`, `/*!`), deduplicated against existing lines.
+- The resulting file is re-parsed. If the error count increased, the attempt is rejected.
+- The file is formatted with `rustfmt` only when it was already `rustfmt --check` clean before the edit.
 
-To ensure exact tool execution without function-calling model overhead, the client requires Ollama to adhere to the following schema structure for operational turns:
+**Failure handling**
 
-### Action Parameters
+A retryable rejection records a diagnostic, restores the snapshot, and starts the next attempt. Retryable rejections include: the editor giving up, a new file that fails to parse, an edit that introduces syntax errors, and a symbol that becomes unresolvable or ambiguous during the attempt.
 
-* `thought` (string): Short reasoning step explaining the choice of action.
+A hard error aborts the run with exit `1` instead of consuming an attempt. This covers transport failures, model responses that do not match the editor schema (invalid JSON, missing fields), and an empty replacement.
 
-* `action` (enum string): Must be one of `read_file`, `replace_symbol`, `run_command`, `spawn_subagent`, or `finish`.
+After all files are written, files marked format-clean are formatted with `rustfmt`; formatting errors are warnings.
 
-* `file_path` (optional string): Target relative path for file operations.
+### 4.9 Verification and retry
 
-* `target_symbol` (optional string): Name of the target function, struct, or impl block when executing AST symbol replacements.
+- Commands run in order and short-circuit on the first failure:
+  1. `cargo check --message-format=json`
+  2. `cargo test --quiet`
+- Timeouts: 600 s per command; on Windows the process tree is killed with `taskkill /T /F`.
+- `cargo check` output is parsed as Cargo JSON (`reason: compiler-message`), keeping `error` and `warning` levels with file, line, column, code, and message. Duplicates are removed and the list is capped at 50. If no JSON is found, stderr/stdout lines starting with `error` or `warning:` are used.
+- `cargo test` failures are summarized from `---- name stdout ----` sections, panic lines, assertion lines, and `test result:` lines, capped at 3,500 characters.
+- The full summary is capped at 6,000 characters.
+- On failure, the summary becomes the next attempt's diagnostics and the snapshot is restored. Exhausting all attempts exits `3`.
 
-* `new_code` (optional string): The updated code content for `target_symbol`.
+### 4.10 Review
 
-* `command` (optional string): Shell command string when executing system commands.
+- The diff is built from `git diff` for tracked files and a synthetic `new file` diff for created files.
+- The stat combines `git diff --stat` with a line count for new files.
+- Diff display is capped at 20,000 bytes.
+- Risk notes are computed from the snapshot's original bytes versus the current file:
+  - test count dropped (counts `#[test]`, `#[tokio::test`, `#[rstest]`),
+  - `Cargo.toml` changed,
+  - a file under `tests/` changed.
+- `--dry-run` restores the snapshot and exits `0` before any commit message call.
 
-* `subagent_task` (optional string): Detailed instructions provided to an isolated child context when spawning a sub-agent.
+### 4.11 Commit
 
-## 6. Execution Lifecycle Example: Automated Bug Fix
+- One model call is prompted for a Conventional Commit message (subject ≤ 72 characters, imperative, no trailing period).
+- If generation fails, a fallback is used: `chore: <first line of task>`.
+- Unless `--yes`, the message is shown and can be replaced on stdin.
+- The user confirms; declining restores the snapshot and exits `2`.
+- Only touched files that still exist are staged with `git add -- <paths>`, never `git add -A`.
+- `git commit -m <message>` runs once. A commit failure leaves the changes staged and exits `1` with recovery instructions.
 
-1. **User Request:** User prompts the TUI: *"Run tests and fix any failing Rust functions."*
+## 5. Model interface
 
-2. **Main Agent Action 1:** Main Agent issues action `run_command` with `"cargo test"`.
+### 5.1 Client
 
-3. **Command Execution & Sanitization:** The Command Executor runs `cargo test`, detects a compilation error in `fn process_data`, extracts the clean error message, and returns it to the Main Agent context.
+- Endpoint: `POST {OLLAMA_HOST}/api/chat`, default `http://127.0.0.1:11434`. A host without a scheme gets `http://`.
+- Requests set `stream: false`, `format: <schema>`, `temperature`, `num_ctx`, `num_predict`, `repeat_penalty: 1.05`, `top_p: 0.9`.
+- A 900 s request timeout applies.
+- If the reply is not valid JSON, the client retries once, appending the invalid reply and a correction instruction. JSON is extracted from prose or fences by brace matching that ignores braces inside strings.
 
-4. **Main Agent Action 2:** Main Agent decides the fix requires trial-and-error. It issues action `spawn_subagent` targeting `process_data` in `src/processor.rs`.
+### 5.2 Schemas
 
-5. **Sub-Agent Loop:**
+Planner:
 
-   * **Sub-Turn A:** Sub-Agent receives *only* `fn process_data` source and the 4-line compiler error. It outputs updated code for `process_data`.
+```json
+{
+  "thought": "string",
+  "needs_clarification": false,
+  "clarification": "string",
+  "plan": "string",
+  "files": [
+    { "path": "string", "symbols": ["string"], "intent": "string", "create": false }
+  ],
+  "verification": ["string"]
+}
+```
 
-   * **Validation:** AST Engine validates syntax (Pass). Harness runs `cargo test` (Fail - logic error).
+Editor (used for both symbol replacement and new files):
 
-   * **Sub-Turn B:** Sub-Agent receives test failure reason in its isolated context, adjusts code, and outputs a revised `process_data`.
+```json
+{
+  "thought": "string",
+  "give_up": false,
+  "new_imports": ["string"],
+  "new_code": "string"
+}
+```
 
-   * **Validation:** AST Engine validates syntax (Pass). Harness runs `cargo test` (Pass).
+Commit:
 
-   * **Teardown:** Sub-Agent completes. Sub-Agent memory is deleted.
+```json
+{ "message": "string" }
+```
 
-6. **Main Agent Action 3:** Main Agent receives message: *"Sub-agent successfully resolved compilation error in `process_data`."*
+Generation limits: planner 1,400 tokens at temperature 0.1; editor 4,096 tokens at 0.1; commit 300 tokens at 0.2.
 
-7. **Main Agent Action 4:** Main Agent outputs `finish` action with thought *"All tests are passing."* UI displays completion message to the user.
+## 6. AST engine
+
+- Grammar: `tree-sitter-rust`.
+- Indexed items: functions, structs, enums, unions, traits, type aliases, consts, statics, macros, impl blocks, trait methods, and inline modules (recursively).
+- Resolution order: exact qualified name (`Type::method`, `module::function`), then short name, then `::`-suffix. Multiple matches produce an ambiguity error listing candidates.
+- When several candidates share a name, impl-block entries are discarded if exactly one non-impl candidate remains.
+- Replacement range starts at the node's line start (including indentation). Contiguous attributes, line comments, and block comments directly above the node, separated by at most one newline, are treated as a preserved prefix.
+- If the model repeats prefix lines, they are removed from the replacement before applying.
+- EOL style follows the source file (`\r\n` or `\n`).
+- Pre-write validation counts tree-sitter error and missing nodes before and after; an increase rejects the edit.
+
+## 7. Safety model
+
+| Risk | Control |
+| --- | --- |
+| Model runs arbitrary commands | No command action exists; verifier runs a fixed command list |
+| Editing a dirty tree | Preflight rejects tracked modifications and staged changes |
+| Losing work on failure | In-memory snapshot of every touched file, restored on rejection, failed verification, `--dry-run`, or declined commit; works on an unborn HEAD |
+| Path escape | Absolute paths and `..` rejected; existing paths canonicalized and checked against the repo root |
+| Staging unrelated files | Only touched, existing paths are staged |
+| Silent test deletion | Test count compared before/after and surfaced in risk notes |
+| Debuggability | Full transcript under `.git/gig/runs/<timestamp>-<pid>/` |
+
+Snapshot entries map repository-relative paths to `Option<Vec<u8>>`; `None` means the agent created the file and rollback deletes it. Entries are recorded once, before the first write, and restored in reverse order.
+
+## 8. Run log
+
+Written under the git directory, so it is never committed:
+
+```
+.git/gig/runs/<unix-seconds>-<pid>/
+  task.txt
+  baseline.txt
+  repo-map.txt
+  plan.json
+  plan-2.json                (after clarification)
+  attempt-<n>/edit-<file>-<symbol>.json
+  attempt-<n>/create-<file>.json
+  attempt-<n>/rejected.txt
+  attempt-<n>/verify.txt
+  final.diff
+  final.stat
+```
+
+Log write failures are ignored; logging never aborts a run.
+
+## 9. Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Success, plan-only, or dry run |
+| `1` | Error: preflight, model, I/O, or commit failure |
+| `2` | Aborted by the user or plan rejected |
+| `3` | Verification failed after all attempts |
+
+## 10. Module map
+
+| File | Responsibility |
+| --- | --- |
+| `src/main.rs` | CLI definition, prompt input, process exit |
+| `src/pipeline.rs` | Stage orchestration, edit/verify loop, diff, review, commit |
+| `src/preflight.rs` | Git state, clean-tree enforcement, model availability |
+| `src/detect.rs` | Cargo project detection, name, edition |
+| `src/repomap.rs` | Gitignore-aware walk, symbol index, lexical ranking, rendering |
+| `src/lang.rs` | Tree-sitter parsing, symbol resolution, replacement, imports, modules, rustfmt |
+| `src/agent.rs` | Planner/editor/commit prompts, plan sanitization, path confinement |
+| `src/model.rs` | `ModelClient` trait, Ollama client, schemas, typed plan/edit, mock client |
+| `src/verify.rs` | Fixed command runner, timeouts, Cargo JSON diagnostics, test-failure extraction |
+| `src/snapshot.rs` | Original-bytes snapshot and rollback |
+| `src/git.rs` | Git wrappers: status, diff, stat, stage, commit |
+| `src/runlog.rs` | Run transcript |
+| `src/ui.rs` | Terminal output, plan/diff/verification rendering, prompts |
+
+## 11. Extension points
+
+- **Languages:** `detect` selects the project, `lang` owns parsing and replacement, and `pipeline` owns the verify command list. The current implementation is Rust-specific; adding a language means adding a detector, an AST implementation, and a verify command set, which would first need a small trait boundary.
+- **Models:** any client implementing `ModelClient` can replace Ollama; `MockClient` exists for deterministic tests.
+- **Retrieval:** the repo map is isolated behind `repomap::build` and `RepoMap::render`, so an embedding-backed ranker can replace lexical scoring without touching the planner.
+
+## 12. Limits
+
+- Rust/Cargo only.
+- A red baseline requires a fully green final result.
+- No Ctrl-C rollback; killing the process can leave edits in place.
+- Warnings do not fail verification.
+- Test tampering is reported, not blocked.
+- Lexical retrieval only.
+- Serial execution; no concurrency.
+- The planner may still propose plausible-but-invalid symbols; sanitization drops them, which can empty the plan.
+- A malformed editor response aborts the run instead of consuming an attempt.
+
+## 13. History
+
+The original specification described a conversational TUI with a main-agent loop, sub-agents, and model-selected shell commands. That design was replaced by the deterministic pipeline above before v0.1.0. The earlier text is preserved in git history.
