@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>gig — local rust patch agent</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,700;1,400&display=swap" rel="stylesheet">
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: { mono: ['"JetBrains Mono"', 'monospace'] },
+                    colors: {
+                        term: {
+                            bg: '#09090b',
+                            panel: '#121215',
+                            border: '#27272a',
+                            muted: '#52525b',
+                            text: '#f4f4f5',
+                            accent: '#22c55e',
+                            cyan: '#38bdf8',
+                            yellow: '#eab308',
+                            red: '#ef4444',
+                            magenta: '#c084fc'
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body {
+            background-color: #09090b;
+            color: #f4f4f5;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-track { background: #09090b; }
+        ::-webkit-scrollbar-thumb { background: #27272a; }
+        
+        @keyframes pulse-dot {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+        .pulse { animation: pulse-dot 1.2s infinite ease-in-out; }
+    </style>
+</head>
+<body class="h-screen flex flex-col justify-between p-3 md:p-6 max-w-4xl mx-auto selection:bg-term-accent selection:text-black font-mono text-xs md:text-sm">
+
+    <!-- TOP BAR -->
+    <header class="flex justify-between items-center border-b border-term-border pb-2.5 shrink-0 select-none">
+        <div class="flex items-center space-x-2">
+            <span class="text-term-accent font-bold tracking-wider">gig</span>
+            <span class="text-term-muted">v0.1.0</span>
+            <span class="text-term-muted">·</span>
+            <span class="text-term-muted text-[11px] hidden sm:inline">rust patch agent</span>
+        </div>
+        
+        <div class="flex items-center space-x-4 text-[11px] text-term-muted">
+            <div class="flex items-center space-x-1.5">
+                <span class="w-1.5 h-1.5 rounded-full bg-term-accent pulse"></span>
+                <span class="text-term-text">qwen2.5-coder:7b</span>
+            </div>
+            <span>16k ctx</span>
+            <button onclick="toggleSpec()" class="hover:text-term-cyan text-term-muted underline underline-offset-2 transition-colors">
+                [?] spec
+            </button>
+        </div>
+    </header>
+
+    <!-- MAIN UNIFIED TERMINAL STREAM -->
+    <main id="terminal-stream" class="flex-1 my-3 overflow-y-auto space-y-2 pr-2 font-mono leading-relaxed flex flex-col justify-end">
+        <div class="text-term-muted text-[11px]"># gig v0.1.0 — local non-interactive patch-and-commit agent</div>
+        <div class="text-term-muted text-[11px]"># All interactions & commit edits happen dynamically in the single prompt input line below.</div>
+        <div class="text-term-muted text-[11px] border-b border-term-border/40 pb-2">----------------------------------------------------------------------</div>
+    </main>
+
+    <!-- BOTTOM INPUT BLOCK -->
+    <footer class="space-y-2 shrink-0 pt-1">
+        
+        <!-- PRESET OPTIONS & MODE TOGGLES -->
+        <div class="flex items-center justify-between text-[11px] text-term-muted px-1 select-none">
+            <div class="flex items-center space-x-3">
+                <span class="text-term-muted">mode:</span>
+                <button onclick="setMode('build')" id="mode-build" class="text-term-accent font-bold hover:underline">--build</button>
+                <button onclick="setMode('plan')" id="mode-plan" class="hover:text-term-text">--plan</button>
+                <button onclick="setMode('dry-run')" id="mode-dry" class="hover:text-term-text">--dry-run</button>
+            </div>
+            <div class="flex items-center space-x-3">
+                <label class="flex items-center space-x-1 cursor-pointer hover:text-term-text">
+                    <input type="checkbox" id="flag-yes" class="accent-term-accent">
+                    <span>--yes</span>
+                </label>
+                <button onclick="injectPresetFault('clarify')" class="hover:text-term-yellow text-[10px] hidden sm:inline">[test: clarify]</button>
+                <button onclick="injectPresetFault('fail')" class="hover:text-term-red text-[10px] hidden sm:inline">[test: cargo fail]</button>
+            </div>
+        </div>
+
+        <!-- THE SINGLE FOCAL INPUT BAR -->
+        <div id="input-container" class="border border-term-border bg-term-panel p-2.5 flex items-center space-x-2 transition-colors focus-within:border-term-accent">
+            <span id="prompt-label" class="text-term-accent font-bold shrink-0 select-none">gig &gt;</span>
+            <input id="main-input" type="text" 
+                value="refactor auth module session cache"
+                placeholder="type task prompt..."
+                autocomplete="off"
+                spellcheck="false"
+                class="w-full bg-transparent outline-none text-term-text placeholder-term-muted font-mono text-xs md:text-sm"
+                autofocus />
+            <button onclick="handleInputSubmit()" class="text-term-muted hover:text-term-accent font-mono text-xs shrink-0 select-none">
+                [↵]
+            </button>
+        </div>
+
+        <!-- COLLAPSIBLE SPECS DRAWER -->
+        <div id="spec-drawer" class="hidden border-t border-term-border pt-2 text-[11px] text-term-muted space-y-1">
+            <div class="flex justify-between text-term-text font-bold">
+                <span>SYSTEM SPECIFICATION (v0.1.0)</span>
+                <button onclick="toggleSpec()" class="text-term-muted hover:text-term-red">[x]</button>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-0.5 pt-1">
+                <div>• <strong class="text-term-text">Local Engine:</strong> Ollama API (`qwen2.5-coder:7b-instruct`), 16k context.</div>
+                <div>• <strong class="text-term-text">Tree-sitter AST:</strong> Precise symbol replacement, grammar validation.</div>
+                <div>• <strong class="text-term-text">Cargo Harness:</strong> Automatic `cargo check` + `cargo test` verification.</div>
+                <div>• <strong class="text-term-text">Commit Customization:</strong> Instant approval on Enter or inline edit in prompt.</div>
+            </div>
+        </div>
+    </footer>
+
+    <script>
+        // State Machine states: 'IDLE' | 'PLAN_GATE' | 'COMMIT_GATE' | 'CLARIFICATION'
+        let currentState = 'IDLE';
+        let currentMode = 'build';
+        let simulatedFault = null; // null | 'clarify' | 'fail'
+        let activeResolver = null;
+        let generatedCommitMsg = "chore: refactor auth module session cache";
+
+        const mainInput = document.getElementById('main-input');
+        const promptLabel = document.getElementById('prompt-label');
+        const stream = document.getElementById('terminal-stream');
+
+        // Global keydown: typing auto-focuses input unless already focused
+        document.addEventListener('keydown', (e) => {
+            if (document.activeElement !== mainInput && e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+                mainInput.focus();
+            }
+        });
+
+        mainInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                handleInputSubmit();
+            }
+        });
+
+        function setMode(mode) {
+            currentMode = mode;
+            ['build', 'plan', 'dry'].forEach(m => {
+                const el = document.getElementById(`mode-${m}`);
+                if (el) el.className = 'hover:text-term-text text-term-muted';
+            });
+            const key = mode === 'dry-run' ? 'dry' : mode;
+            document.getElementById(`mode-${key}`).className = 'text-term-accent font-bold hover:underline';
+        }
+
+        function injectPresetFault(type) {
+            simulatedFault = type;
+            log(`[test preset armed: ${type}]`, 'muted');
+        }
+
+        function toggleSpec() {
+            const drawer = document.getElementById('spec-drawer');
+            drawer.classList.toggle('hidden');
+        }
+
+        function updatePromptStyle(state, payload = null) {
+            currentState = state;
+            const container = document.getElementById('input-container');
+            
+            if (state === 'IDLE') {
+                promptLabel.textContent = 'gig >';
+                promptLabel.className = 'text-term-accent font-bold shrink-0 select-none';
+                container.className = 'border border-term-border bg-term-panel p-2.5 flex items-center space-x-2 transition-colors focus-within:border-term-accent';
+                mainInput.value = '';
+                mainInput.placeholder = 'type task prompt...';
+            } else if (state === 'PLAN_GATE') {
+                promptLabel.textContent = 'confirm plan? [y/n/c] >';
+                promptLabel.className = 'text-term-yellow font-bold shrink-0 select-none';
+                container.className = 'border border-term-yellow bg-term-panel p-2.5 flex items-center space-x-2 transition-colors';
+                mainInput.value = 'y';
+                mainInput.placeholder = 'y = approve plan, n = abort, c = clarify...';
+                mainInput.select();
+            } else if (state === 'COMMIT_GATE') {
+                generatedCommitMsg = payload || "chore: update AST nodes";
+                promptLabel.textContent = 'commit msg >';
+                promptLabel.className = 'text-term-cyan font-bold shrink-0 select-none';
+                container.className = 'border border-term-cyan bg-term-panel p-2.5 flex items-center space-x-2 transition-colors';
+                mainInput.value = generatedCommitMsg;
+                mainInput.placeholder = 'Press Enter to accept msg, edit inline, or type "n" to cancel...';
+                mainInput.select();
+            } else if (state === 'CLARIFICATION') {
+                promptLabel.textContent = 'clarification answer >';
+                promptLabel.className = 'text-term-magenta font-bold shrink-0 select-none';
+                container.className = 'border border-term-magenta bg-term-panel p-2.5 flex items-center space-x-2 transition-colors';
+                mainInput.value = '';
+                mainInput.placeholder = 'type answer for Ollama planner...';
+            }
+        }
+
+        function log(text, style = 'normal') {
+            const div = document.createElement('div');
+            let colors = 'text-term-text';
+            
+            if (style === 'cmd') colors = 'text-term-cyan font-bold';
+            if (style === 'success') colors = 'text-term-accent';
+            if (style === 'warn') colors = 'text-term-yellow';
+            if (style === 'error') colors = 'text-term-red font-bold';
+            if (style === 'muted') colors = 'text-term-muted';
+            if (style === 'magenta') colors = 'text-term-magenta';
+
+            div.className = colors;
+            div.textContent = text;
+            stream.appendChild(div);
+            stream.scrollTop = stream.scrollHeight;
+        }
+
+        function logDiff() {
+            const container = document.createElement('div');
+            container.className = 'border border-term-border/60 bg-black/40 p-2 my-1 space-y-0.5 text-[12px] font-mono';
+            container.innerHTML = `
+                <div class="text-term-muted">diff --git a/src/auth.rs b/src/auth.rs</div>
+                <div class="text-term-muted">--- a/src/auth.rs</div>
+                <div class="text-term-muted">+++ b/src/auth.rs</div>
+                <div class="text-term-cyan">@@ -18,6 +18,7 @@ impl SessionCache {</div>
+                <div class="text-term-muted">     pub fn invalidate_expired(&mut self) {</div>
+                <div class="text-term-red">-        // static timeout bug</div>
+                <div class="text-term-accent">+        self.entries.retain(|_, session| !session.is_expired());</div>
+                <div class="text-term-muted">     }</div>
+            `;
+            stream.appendChild(container);
+            stream.scrollTop = stream.scrollHeight;
+        }
+
+        const delay = ms => new Promise(r => setTimeout(r, ms));
+
+        function awaitUserChoice() {
+            return new Promise((resolve) => {
+                activeResolver = resolve;
+            });
+        }
+
+        function handleInputSubmit() {
+            const val = mainInput.value;
+            
+            if (currentState === 'IDLE') {
+                const trimmed = val.trim();
+                mainInput.value = '';
+                if (!trimmed) return;
+                runGigPipeline(trimmed);
+            } else if (activeResolver) {
+                const res = activeResolver;
+                activeResolver = null;
+                res(val);
+            }
+        }
+
+        async function runGigPipeline(taskPrompt) {
+            const isYes = document.getElementById('flag-yes').checked;
+
+            log(`\n$ gig "${taskPrompt}" --${currentMode} ${isYes ? '--yes' : ''}`, 'cmd');
+
+            // 1. Preflight
+            await delay(200);
+            log('[preflight] git status clean (branch: main), model qwen2.5-coder:7b ready.', 'muted');
+
+            // 2. Detection & Baseline
+            await delay(200);
+            log('[baseline] cargo check ... OK | cargo test ... OK (green baseline)', 'success');
+
+            // 3. Planning
+            await delay(300);
+            log('[plan] mapped repository (tree-sitter scored 2 files)');
+            
+            // Check simulated clarification fault
+            if (simulatedFault === 'clarify') {
+                simulatedFault = null;
+                log('[plan] Ollama requested clarification:', 'warn');
+                log('  ? "Should expired sessions trigger telemetry emission?"', 'magenta');
+                
+                updatePromptStyle('CLARIFICATION');
+                const answer = await awaitUserChoice();
+                log(`answer > ${answer}`, 'muted');
+                log('[plan] re-planning with clarification answer...', 'muted');
+                await delay(250);
+            }
+
+            log('\nSanitized Plan Targets:', 'cmd');
+            log('  ├── src/auth.rs -> symbol: SessionCache::invalidate_expired', 'text');
+            log('  └── tests/auth_test.rs -> symbol: test_session_ttl', 'text');
+
+            if (currentMode === 'plan') {
+                updatePromptStyle('IDLE');
+                log('\n[exit 0] Plan generated successfully (--plan mode).', 'success');
+                return;
+            }
+
+            // 4. Plan Gate inside main input
+            if (!isYes) {
+                log('\nAccept plan? [y = continue, n = abort, c = clarify]', 'warn');
+                updatePromptStyle('PLAN_GATE');
+                const choice = (await awaitUserChoice()).trim().toLowerCase();
+                log(`confirm plan > ${choice}`, 'muted');
+
+                if (choice === 'n' || choice === 'no' || choice === 'cancel') {
+                    updatePromptStyle('IDLE');
+                    log('[exit 2] Aborted by user at plan gate.', 'error');
+                    return;
+                } else if (choice === 'c') {
+                    updatePromptStyle('CLARIFICATION');
+                    log('\nEnter clarification details:', 'magenta');
+                    const text = await awaitUserChoice();
+                    log(`clarification > ${text}`, 'muted');
+                    log('[plan] re-planning...', 'muted');
+                    await delay(300);
+                }
+            }
+
+            // 5. Tree-sitter Edit Loop
+            await delay(300);
+            log('[edit] snapshot recorded for src/auth.rs', 'muted');
+            log('[edit] tree-sitter node replaced: SessionCache::invalidate_expired', 'muted');
+
+            // 6. Cargo Verification Harness
+            await delay(400);
+            if (simulatedFault === 'fail') {
+                simulatedFault = null;
+                log('[verify] cargo check ... OK', 'success');
+                log('[verify] cargo test ... FAILED (test_session_ttl panicked)', 'error');
+                log('[rollback] restoring file snapshots from memory...', 'warn');
+                updatePromptStyle('IDLE');
+                log('[exit 3] Verification failed after attempt 1.', 'error');
+                return;
+            }
+
+            log('[verify] cargo check ... OK', 'success');
+            log('[verify] cargo test ... OK (18 passed, 0 failed)', 'success');
+
+            // 7. Review Gate & Diff
+            log('\n[review] synthesized patch diff:', 'cmd');
+            logDiff();
+
+            if (currentMode === 'dry-run') {
+                log('[dry-run] restoring snapshots before exit.', 'muted');
+                updatePromptStyle('IDLE');
+                log('[exit 0] Dry run finished.', 'success');
+                return;
+            }
+
+            // 8. Commit Confirmation & Customization inside main input
+            let finalCommitMsg = `refactor(auth): ${taskPrompt.toLowerCase()}`;
+            
+            if (!isYes) {
+                log('\n[commit gate] Ollama generated message:', 'cyan');
+                log(`  "${finalCommitMsg}"`, 'text');
+                log('  ↳ Press Enter to accept, edit/type custom message, or type "n" to abort:', 'muted');
+                
+                updatePromptStyle('COMMIT_GATE', finalCommitMsg);
+                const userInput = await awaitUserChoice();
+                const trimmedInput = userInput.trim();
+
+                if (trimmedInput.toLowerCase() === 'n' || trimmedInput.toLowerCase() === 'no' || trimmedInput.toLowerCase() === 'cancel') {
+                    log('commit msg > [declined]', 'muted');
+                    log('[rollback] restoring file snapshots...', 'warn');
+                    updatePromptStyle('IDLE');
+                    log('[exit 2] Commit cancelled by user.', 'error');
+                    return;
+                }
+
+                // If input is non-empty and not 'y', replace the message with the custom text
+                if (trimmedInput && trimmedInput.toLowerCase() !== 'y') {
+                    finalCommitMsg = userInput; // keep exact casing & string
+                    log(`commit msg > customized to: "${finalCommitMsg}"`, 'success');
+                } else {
+                    log(`commit msg > accepted: "${finalCommitMsg}"`, 'muted');
+                }
+            }
+
+            // 9. Git Commit Execution
+            await delay(250);
+            log('[commit] git add -- src/auth.rs', 'muted');
+            log(`[commit] git commit -m "${finalCommitMsg}"`, 'success');
+            
+            updatePromptStyle('IDLE');
+            log('\n[exit 0] Patch committed successfully.', 'success');
+        }
+    </script>
+</body>
+</html>
