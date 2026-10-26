@@ -155,19 +155,36 @@ impl ModelClient for OllamaClient {
                 eprintln!("[model] user:\n{}", truncate(user, 6000));
             }
 
-            let response = self
-                .http
-                .post(format!("{}/api/chat", self.base))
-                .json(&body)
-                .timeout(Duration::from_secs(900))
-                .send()
-                .await
-                .context("failed to reach Ollama; is `ollama serve` running?")?;
-            let status = response.status();
-            let text = response
-                .text()
-                .await
-                .context("failed to read the Ollama response")?;
+            let mut status = reqwest::StatusCode::OK;
+            let mut text = String::new();
+            for retry in 0..=2 {
+                let response = self
+                    .http
+                    .post(format!("{}/api/chat", self.base))
+                    .json(&body)
+                    .timeout(Duration::from_secs(900))
+                    .send()
+                    .await
+                    .context("failed to reach Ollama; is `ollama serve` running?")?;
+                status = response.status();
+                text = response
+                    .text()
+                    .await
+                    .context("failed to read the Ollama response")?;
+                // Transient server errors (e.g. a repeat-limit abort) are
+                // worth one or two retries before giving up.
+                if !status.is_server_error() || retry == 2 {
+                    break;
+                }
+                if self.verbose {
+                    eprintln!(
+                        "[model] upstream {status}; retrying ({}/2)...\n{}",
+                        retry + 1,
+                        truncate(&text, 400)
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(500 * (retry as u64 + 1))).await;
+            }
             if !status.is_success() {
                 bail!("Ollama returned {status}: {}", truncate(&text, 600));
             }

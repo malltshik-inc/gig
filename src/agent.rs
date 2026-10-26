@@ -63,6 +63,7 @@ Rules:
 - For methods use the qualified name, e.g. `Type::method`.
 - Non-Rust files listed in the map (e.g. Cargo.toml) are edited as a whole: list the file with `symbols` empty and describe the change in `intent`.
 - You may create new files, including text files such as `docs/foo.md`, with `create: true` and `symbols` empty.
+- When the task contains USER FEEDBACK and a PREVIOUS PLAN marked as rejected by the user, your new plan must apply every point of the feedback and drop exactly what the user rejected.
 - Do not modify tests, CI, or test infrastructure to make a build pass. Never delete or ignore a test.
 - If baseline verification is shown, treat it as the bug to fix. Never change a test's expected value to match broken behavior; the implementation must satisfy the existing tests.
 - Do not add dependencies unless the task cannot be done without one.
@@ -295,7 +296,7 @@ Respond with JSON only."#;
             &user,
             model::editor_schema(),
             ChatOptions {
-                max_tokens: 4096,
+                max_tokens: 8192,
                 temperature: 0.1,
             },
         )
@@ -331,8 +332,8 @@ pub async fn edit_existing_file(
 
 Rules:
 - Return the ENTIRE file: every line, including the parts that do not change.
-- Preserve formatting, ordering, comments, and unrelated content exactly.
-- Implement only the change described in the task and plan.
+- Make ONLY the change described in the task and plan. Do not add or remove comments, headers, footers, blank lines, or explanatory text.
+- Preserve formatting, ordering, and unrelated content exactly.
 - Do not wrap code in markdown fences. Do not put commentary inside new_code.
 - Your reply is parsed as JSON: escape every `"` inside new_code as `\"`.
 - Set give_up to true only when the required change is genuinely underdetermined.
@@ -371,7 +372,7 @@ Respond with JSON only."#;
             &user,
             model::editor_schema(),
             ChatOptions {
-                max_tokens: 4096,
+                max_tokens: 8192,
                 temperature: 0.1,
             },
         )

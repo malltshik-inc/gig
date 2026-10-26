@@ -77,6 +77,52 @@ pub fn confirm(question: &str, default_yes: bool, auto_yes: bool) -> Result<bool
     Ok(matches!(answer.as_str(), "y" | "yes"))
 }
 
+/// The outcome of the plan-approval prompt. Anything that is not a clear
+/// yes/no is treated as revision feedback for the planner.
+#[derive(Debug)]
+pub enum PlanApproval {
+    Approved,
+    Rejected,
+    Revision(String),
+}
+
+pub fn ask_plan_approval(
+    question: &str,
+    default_yes: bool,
+    auto_yes: bool,
+) -> Result<PlanApproval> {
+    if auto_yes {
+        return Ok(PlanApproval::Approved);
+    }
+    let hint = if default_yes { "[Y/n]" } else { "[y/N]" };
+    print!("  {} {hint} ", paint(question, "1"));
+    io::stdout().flush().context("failed to flush stdout")?;
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .context("failed to read confirmation")?;
+    Ok(classify_plan_answer(&line, default_yes))
+}
+
+/// Turn a raw approval answer into its outcome. Empty means "default",
+/// `y`/`yes`/`n`/`no` decide, and any other text becomes revision feedback.
+fn classify_plan_answer(raw: &str, default_yes: bool) -> PlanApproval {
+    let answer = raw.trim();
+    if answer.is_empty() {
+        return if default_yes {
+            PlanApproval::Approved
+        } else {
+            PlanApproval::Rejected
+        };
+    }
+    match answer.to_lowercase().as_str() {
+        "y" | "yes" => PlanApproval::Approved,
+        "n" | "no" => PlanApproval::Rejected,
+        // Keep the original casing; only the decision match is lowercased.
+        _ => PlanApproval::Revision(answer.trim().to_string()),
+    }
+}
+
 pub fn ask(question: &str) -> Result<String> {
     print!("  {} ", paint(question, "1"));
     io::stdout().flush().context("failed to flush stdout")?;
@@ -173,4 +219,49 @@ fn safe_boundary(text: &str, max: usize) -> usize {
         end -= 1;
     }
     end
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_clear_yes_and_no() {
+        assert!(matches!(
+            classify_plan_answer("", true),
+            PlanApproval::Approved
+        ));
+        assert!(matches!(
+            classify_plan_answer("", false),
+            PlanApproval::Rejected
+        ));
+        assert!(matches!(
+            classify_plan_answer("y", true),
+            PlanApproval::Approved
+        ));
+        assert!(matches!(
+            classify_plan_answer("YES\n", true),
+            PlanApproval::Approved
+        ));
+        assert!(matches!(
+            classify_plan_answer("n", true),
+            PlanApproval::Rejected
+        ));
+        assert!(matches!(
+            classify_plan_answer("No", true),
+            PlanApproval::Rejected
+        ));
+    }
+
+    #[test]
+    fn classifies_free_text_as_revision() {
+        let answer = classify_plan_answer("don't create a new file, only update Cargo.toml", true);
+        match answer {
+            PlanApproval::Revision(text) => {
+                assert!(text.contains("don't create a new file"), "{text}");
+                assert!(text.contains("only update Cargo.toml"), "{text}");
+            }
+            other => panic!("expected revision, got {other:?}"),
+        }
+    }
 }

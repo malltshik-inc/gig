@@ -9,8 +9,7 @@ use crate::agent;
 use crate::detect;
 use crate::git;
 use crate::lang;
-use crate::model::OllamaClient;
-use crate::model::Rename;
+use crate::model::{OllamaClient, Plan, Rename};
 use crate::preflight;
 use crate::repomap;
 use crate::runlog::RunLog;
@@ -22,6 +21,27 @@ use crate::verify::{self, VerifyCommand};
 pub enum RunMode {
     Plan,
     Build,
+}
+
+/// Maximum planner revisions from plan-approval feedback before aborting.
+const MAX_PLAN_REVISIONS: usize = 3;
+
+/// A compact fingerprint of a plan (files, symbols, renames) used to tell
+/// whether a revision actually changed anything.
+fn plan_signature(plan: &Plan) -> String {
+    let mut signature = String::new();
+    for file in &plan.files {
+        signature.push_str(&format!(
+            "{}|create={}|{}\n",
+            file.path,
+            file.create,
+            file.symbols.join("+")
+        ));
+    }
+    for rename in &plan.renames {
+        signature.push_str(&format!("{}->{}\n", rename.from, rename.to));
+    }
+    signature
 }
 
 /// Plan mode is the default. `--build` selects build mode, and `--dry-run`
@@ -189,9 +209,58 @@ pub async fn run(cli: Cli, prompt: String) -> Result<i32> {
         ui::info("plan mode; no files were changed");
         return Ok(0);
     }
-    if !ui::confirm("proceed with this plan?", true, cli.yes)? {
-        ui::info("aborted; no files were changed");
-        return Ok(2);
+
+    // Ask for approval. A clear yes or no decides; anything else is revision
+    // feedback that we send back to the planner for a new plan, then re-ask.
+    let mut revisions = 0usize;
+    loop {
+        match ui::ask_plan_approval("proceed with this plan?", true, cli.yes)? {
+            ui::PlanApproval::Approved => break,
+            ui::PlanApproval::Rejected => {
+                ui::info("aborted; no files were changed");
+                return Ok(2);
+            }
+            ui::PlanApproval::Revision(feedback) => {
+                revisions += 1;
+                if revisions > MAX_PLAN_REVISIONS {
+                    ui::warn("too many plan revisions; aborting");
+                    return Ok(2);
+                }
+                ui::stage(&format!("revise plan ({revisions}/{MAX_PLAN_REVISIONS})"));
+                ui::detail(&feedback);
+                task.push_str(&format!(
+                    "\n\nPLAN REVISION {revisions}:\nUSER FEEDBACK:\n{feedback}\nPREVIOUS PLAN (rejected by the user):\n{}",
+                    plan.plan
+                ));
+                let previous_signature = plan_signature(&plan);
+                plan = agent::plan(
+                    &client,
+                    &agent::PlanContext {
+                        task: &task,
+                        project_name: &project.name,
+                        edition: &project.edition,
+                        repo_map: &rendered_map,
+                        baseline: &baseline,
+                        max_files: cli.max_files.max(1),
+                    },
+                )
+                .await?;
+                log.write_json(&format!("plan-revision-{revisions}.json"), &plan);
+                plan = agent::sanitize_plan(plan, &pf.root, cli.max_files.max(1))?;
+                if plan.files.is_empty() && plan.renames.is_empty() {
+                    ui::warn(
+                        "the revised plan produced no actionable edits; answer with a clearer revision or n to abort",
+                    );
+                } else if plan_signature(&plan) == previous_signature {
+                    ui::warn(
+                        "the revised plan is unchanged; the planner did not apply your feedback — try renaming what must change or answer n to abort",
+                    );
+                    ui::print_plan(&plan);
+                } else {
+                    ui::print_plan(&plan);
+                }
+            }
+        }
     }
 
     let max_attempts = cli.max_attempts.max(1);
