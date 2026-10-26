@@ -19,6 +19,8 @@ pub struct ModelReply {
     pub prompt_tokens: u64,
     pub eval_tokens: u64,
     pub elapsed_ms: u128,
+    /// True when Ollama stopped at the output limit, so the JSON may be cut off.
+    pub truncated: bool,
 }
 
 #[async_trait]
@@ -130,6 +132,7 @@ impl ModelClient for OllamaClient {
             json!({"role": "user", "content": user}),
         ];
         let mut last_content = String::new();
+        let mut last_truncated = false;
 
         for attempt in 0..2 {
             let body = json!({
@@ -176,12 +179,21 @@ impl ModelClient for OllamaClient {
                 eprintln!("[model] reply:\n{}", truncate(&content, 6000));
             }
 
+            let truncated = match parsed.done_reason.as_deref() {
+                Some(reason) => reason == "length",
+                None => parsed
+                    .eval_count
+                    .is_some_and(|count| count >= u64::from(options.max_tokens)),
+            };
+            last_truncated = truncated;
+
             if let Some(value) = extract_json(&content) {
                 return Ok(ModelReply {
                     value,
                     prompt_tokens: parsed.prompt_eval_count.unwrap_or(0),
                     eval_tokens: parsed.eval_count.unwrap_or(0),
                     elapsed_ms: start.elapsed().as_millis(),
+                    truncated,
                 });
             }
 
@@ -196,7 +208,12 @@ impl ModelClient for OllamaClient {
         }
 
         bail!(
-            "the model did not return valid JSON; last reply:\n{}",
+            "the model did not return valid JSON{}; last reply:\n{}",
+            if last_truncated {
+                " (it hit the output limit before finishing)"
+            } else {
+                ""
+            },
             truncate(&last_content, 800)
         )
     }
@@ -207,6 +224,8 @@ struct ChatResponse {
     message: ChatMessage,
     prompt_eval_count: Option<u64>,
     eval_count: Option<u64>,
+    #[serde(default)]
+    done_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -271,6 +290,17 @@ pub fn planner_schema() -> Value {
                     "required": ["path", "symbols", "intent", "create"]
                 }
             },
+            "renames": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "from": {"type": "string"},
+                        "to": {"type": "string"}
+                    },
+                    "required": ["from", "to"]
+                }
+            },
             "verification": {"type": "array", "items": {"type": "string"}}
         },
         "required": [
@@ -279,6 +309,7 @@ pub fn planner_schema() -> Value {
             "clarification",
             "plan",
             "files",
+            "renames",
             "verification"
         ]
     })
@@ -319,8 +350,17 @@ pub struct Plan {
     pub plan: String,
     #[serde(default)]
     pub files: Vec<PlanFile>,
+    /// Whole-crate identifier renames, applied deterministically before edits.
+    #[serde(default)]
+    pub renames: Vec<Rename>,
     #[serde(default)]
     pub verification: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Rename {
+    pub from: String,
+    pub to: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -344,6 +384,9 @@ pub struct Edit {
     pub new_imports: Vec<String>,
     #[serde(default)]
     pub new_code: String,
+    /// Set by the harness when Ollama stopped at the output limit.
+    #[serde(skip)]
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -387,6 +430,7 @@ impl ModelClient for MockClient {
             prompt_tokens: 0,
             eval_tokens: 0,
             elapsed_ms: 0,
+            truncated: false,
         })
     }
 }

@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::lang;
-use crate::model::{self, ChatOptions, CommitMessage, Edit, ModelClient, Plan, PlanFile};
+use crate::model::{self, ChatOptions, CommitMessage, Edit, ModelClient, Plan, PlanFile, Rename};
 use crate::ui;
 
 pub struct PlanContext<'a> {
@@ -29,6 +29,7 @@ Rules:
 - Do not modify tests, CI, or test infrastructure to make a build pass. Never delete or ignore a test.
 - If baseline verification is shown, treat it as the bug to fix. Never change a test's expected value to match broken behavior; the implementation must satisfy the existing tests.
 - Do not add dependencies unless the task cannot be done without one.
+- If the task renames an existing item, record it in `renames` as {"from": "Old", "to": "New"} and leave that symbol out of `files`; the harness rewrites every occurrence in the crate.
 - Prefer the single most specific matching symbol and proceed. Set needs_clarification only when no listed symbol could plausibly satisfy the task.
 - Leave `verification` empty; the harness chooses the commands.
 - Keep `plan` to a short numbered list of edits.
@@ -84,6 +85,7 @@ Rules:
 - The task and plan are authoritative. If the intended behavior is stated, implement it even when the tests are not shown; the harness runs them after your edit.
 - If new imports or module declarations are required, put complete `use` lines or `mod name;` lines in new_imports. Do not duplicate items that already exist.
 - Do not wrap code in markdown fences. Do not put commentary inside new_code.
+- Your reply is parsed as JSON: escape every `"` inside new_code as `\"` and never stop in the middle of the symbol.
 - Set give_up to true only when the required change is genuinely underdetermined.
 - Never delete tests, add #[ignore], or weaken assertions.
 Respond with JSON only."#;
@@ -132,6 +134,7 @@ Respond with JSON only."#;
         .await?;
     let mut edit: Edit = serde_json::from_value(reply.value)
         .context("the editor returned JSON that does not match the edit schema")?;
+    edit.truncated = reply.truncated;
     edit.new_code = clean_code(&edit.new_code);
     if !edit.give_up && edit.new_code.trim().is_empty() {
         bail!(
@@ -199,6 +202,7 @@ Respond with JSON only."#;
         .await?;
     let mut edit: Edit = serde_json::from_value(reply.value)
         .context("the editor returned JSON that does not match the edit schema")?;
+    edit.truncated = reply.truncated;
     edit.new_code = clean_code(&edit.new_code);
     if !edit.give_up && edit.new_code.trim().is_empty() {
         bail!("the editor returned an empty file for `{}`", context.file);
@@ -260,6 +264,24 @@ fn clean_commit_message(raw: &str) -> String {
 }
 
 pub fn sanitize_plan(mut plan: Plan, root: &Path, max_files: usize) -> Result<Plan> {
+    let mut renames: Vec<Rename> = Vec::new();
+    for rename in plan.renames.drain(..) {
+        let from = rename.from.trim().to_string();
+        let to = rename.to.trim().to_string();
+        if !lang::is_identifier(&from) || !lang::is_identifier(&to) {
+            ui::warn(&format!(
+                "dropping rename `{from}` -> `{to}`: not a valid Rust identifier"
+            ));
+            continue;
+        }
+        if from == to || renames.iter().any(|entry| entry.from == from) {
+            continue;
+        }
+        renames.push(Rename { from, to });
+    }
+    let rename_sources: BTreeSet<String> =
+        renames.iter().map(|rename| rename.from.clone()).collect();
+
     let mut files: Vec<PlanFile> = Vec::new();
 
     for file in plan.files.into_iter().take(max_files.max(1)) {
@@ -296,12 +318,20 @@ pub fn sanitize_plan(mut plan: Plan, root: &Path, max_files: usize) -> Result<Pl
             continue;
         }
 
-        let source = std::fs::read_to_string(&absolute)
+        let mut source = std::fs::read_to_string(&absolute)
             .with_context(|| format!("failed to read {}", absolute.display()))?;
+        for rename in &renames {
+            source = lang::rename_occurrences(&source, &rename.from, &rename.to)?.0;
+        }
         let mut valid = Vec::new();
+        let mut handled_by_rename = false;
         for raw in &file.symbols {
             let symbol = normalize_symbol(raw);
             if symbol.is_empty() {
+                continue;
+            }
+            if rename_sources.contains(&symbol) {
+                handled_by_rename = true;
                 continue;
             }
             match lang::resolve(&source, &symbol) {
@@ -319,9 +349,11 @@ pub fn sanitize_plan(mut plan: Plan, root: &Path, max_files: usize) -> Result<Pl
         }
 
         if valid.is_empty() {
-            ui::warn(&format!(
-                "dropping `{relative_string}`: the plan named no symbols that exist in the file"
-            ));
+            if !handled_by_rename {
+                ui::warn(&format!(
+                    "dropping `{relative_string}`: the plan named no symbols that exist in the file"
+                ));
+            }
             continue;
         }
 
@@ -348,6 +380,7 @@ pub fn sanitize_plan(mut plan: Plan, root: &Path, max_files: usize) -> Result<Pl
     }
 
     plan.files = merged;
+    plan.renames = renames;
     Ok(plan)
 }
 
@@ -477,5 +510,73 @@ mod tests {
             normalize_symbol("tests::adds_two_numbers (function)"),
             "tests::adds_two_numbers"
         );
+    }
+
+    #[test]
+    fn sanitize_plan_uses_renames_for_matching_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/model.rs"),
+            "pub struct OllamaClient { base: String }\n\nimpl OllamaClient {\n    fn new() -> Self { Self { base: String::new() } }\n}\n",
+        )
+        .unwrap();
+
+        let plan = Plan {
+            thought: String::new(),
+            needs_clarification: false,
+            clarification: String::new(),
+            plan: String::new(),
+            files: vec![PlanFile {
+                path: "src/model.rs".to_string(),
+                symbols: vec![
+                    "OllamaClient (struct)".to_string(),
+                    "OllamaClient (impl)".to_string(),
+                ],
+                intent: String::new(),
+                create: false,
+            }],
+            renames: vec![Rename {
+                from: "OllamaClient".to_string(),
+                to: "LocalModelServerClient".to_string(),
+            }],
+            verification: Vec::new(),
+        };
+
+        let sanitized = sanitize_plan(plan, dir.path(), 6).unwrap();
+        assert_eq!(
+            sanitized.renames,
+            vec![Rename {
+                from: "OllamaClient".to_string(),
+                to: "LocalModelServerClient".to_string(),
+            }]
+        );
+        // Both symbols were handled by the rename, so no per-symbol edits remain.
+        assert!(sanitized.files.is_empty());
+    }
+
+    #[test]
+    fn sanitize_plan_drops_invalid_renames() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = Plan {
+            thought: String::new(),
+            needs_clarification: false,
+            clarification: String::new(),
+            plan: String::new(),
+            files: Vec::new(),
+            renames: vec![
+                Rename {
+                    from: "not valid".to_string(),
+                    to: "NewName".to_string(),
+                },
+                Rename {
+                    from: "OllamaClient".to_string(),
+                    to: "OllamaClient".to_string(),
+                },
+            ],
+            verification: Vec::new(),
+        };
+        let sanitized = sanitize_plan(plan, dir.path(), 6).unwrap();
+        assert!(sanitized.renames.is_empty());
     }
 }

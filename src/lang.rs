@@ -553,32 +553,181 @@ fn count_errors(node: Node<'_>) -> usize {
     count
 }
 
-fn find_error<'a>(node: Node<'a>) -> Option<Node<'a>> {
+fn collect_errors<'a>(node: Node<'a>, out: &mut Vec<Node<'a>>) {
     if node.is_error() || node.is_missing() {
-        return Some(node);
+        out.push(node);
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if let Some(error) = find_error(child) {
-            return Some(error);
-        }
+        collect_errors(child, out);
     }
-    None
 }
 
+/// Report the first syntax error in a form the model can act on.
+///
+/// tree-sitter wraps the whole input in a single `ERROR` node starting at 1:1
+/// whenever a delimiter is never closed. Reporting that node verbatim ("line 1,
+/// column 1: unexpected `ERROR`") is useless, so an unclosed delimiter is
+/// described by its own position instead.
 pub fn first_error_summary(source: &str) -> String {
     let tree = match parse(source) {
         Ok(tree) => tree,
         Err(error) => return format!("{error:#}"),
     };
-    match find_error(tree.root_node()) {
-        Some(node) => format!(
-            "line {}, column {}: unexpected `{}`",
+    summarize_errors(source, tree.root_node())
+}
+
+fn summarize_errors(source: &str, root: Node<'_>) -> String {
+    let mut errors = Vec::new();
+    collect_errors(root, &mut errors);
+    if errors.is_empty() {
+        return "no syntax errors".to_string();
+    }
+
+    // A single error node spanning the whole input, or an ERROR root, means
+    // the parser could not find any recovery point — almost always an
+    // unclosed delimiter, for example truncated model output.
+    if errors.len() == 1
+        && errors[0].byte_range().start == 0
+        && errors[0].byte_range().end >= source.len()
+    {
+        return describe_unterminated(root);
+    }
+    if root.is_error() {
+        return describe_unterminated(root);
+    }
+
+    // Something more specific: describe the first real error node.
+    let first = errors
+        .iter()
+        .find(|node| node.id() != root.id())
+        .copied()
+        .unwrap_or_else(|| errors[0]);
+    describe_node(first, source)
+}
+
+fn describe_node(node: Node<'_>, source: &str) -> String {
+    let line = node.start_position().row + 1;
+    let column = node.start_position().column + 1;
+    if node.is_missing() {
+        return format!(
+            "line {line}, column {column}: expected `{}` before the input ended",
+            node.kind()
+        );
+    }
+    let snippet: String = text(node, source)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(60)
+        .collect();
+    if snippet.is_empty() {
+        format!("line {line}, column {column}: unexpected `{}`", node.kind())
+    } else {
+        format!(
+            "line {line}, column {column}: unexpected `{}` near `{snippet}`",
+            node.kind()
+        )
+    }
+}
+
+fn describe_unterminated(root: Node<'_>) -> String {
+    let mut open = Vec::new();
+    collect_delimiters(root, &mut open);
+    if let Some(node) = open.last() {
+        return format!(
+            "line {}, column {}: `{}` is never closed; the code looks truncated",
             node.start_position().row + 1,
             node.start_position().column + 1,
             node.kind()
-        ),
-        None => "unknown syntax error".to_string(),
+        );
+    }
+    let end = root.end_position();
+    format!(
+        "line {}, column {}: the input does not parse as Rust",
+        end.row + 1,
+        end.column + 1
+    )
+}
+
+fn collect_delimiters<'a>(node: Node<'a>, open: &mut Vec<Node<'a>>) {
+    if node.child_count() == 0 {
+        match node.kind() {
+            "(" | "[" | "{" => open.push(node),
+            ")" | "]" | "}" => {
+                open.pop();
+            }
+            _ => {}
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_delimiters(child, open);
+    }
+}
+
+/// Check a symbol replacement on its own before it is spliced into a file.
+/// Returns `None` when it parses, otherwise a message the model can act on.
+pub fn syntax_problem(code: &str) -> Option<String> {
+    let tree = match parse(code) {
+        Ok(tree) => tree,
+        Err(error) => return Some(format!("{error:#}")),
+    };
+    if !tree.root_node().has_error() {
+        return None;
+    }
+    Some(summarize_errors(code, tree.root_node()))
+}
+
+/// True for names that can be used as a Rust identifier.
+pub fn is_identifier(name: &str) -> bool {
+    let mut characters = name.chars();
+    match characters.next() {
+        Some(first) if first.is_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    characters.all(|character| character.is_alphanumeric() || character == '_')
+}
+
+/// Replace whole-identifier occurrences of `from` with `to`.
+///
+/// Only identifier tokens are touched, so comments, string literals, and longer
+/// names that merely contain `from` are left alone. Returns the new source and
+/// the number of replacements.
+pub fn rename_occurrences(source: &str, from: &str, to: &str) -> Result<(String, usize)> {
+    if from.is_empty() || from == to {
+        return Ok((source.to_string(), 0));
+    }
+    let tree = parse(source)?;
+    let mut ranges = Vec::new();
+    collect_identifiers(tree.root_node(), source, from, &mut ranges);
+    if ranges.is_empty() {
+        return Ok((source.to_string(), 0));
+    }
+    let mut output = source.to_string();
+    for (start, end) in ranges.iter().rev() {
+        output.replace_range(*start..*end, to);
+    }
+    Ok((output, ranges.len()))
+}
+
+fn collect_identifiers(node: Node<'_>, source: &str, needle: &str, out: &mut Vec<(usize, usize)>) {
+    if node.child_count() == 0 {
+        if matches!(
+            node.kind(),
+            "identifier" | "type_identifier" | "field_identifier" | "shorthand_field_identifier"
+        ) && text(node, source) == needle
+        {
+            out.push((node.start_byte(), node.end_byte()));
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_identifiers(child, source, needle, out);
     }
 }
 
@@ -788,5 +937,45 @@ mod inner {
     fn rejects_missing_symbols() {
         let error = resolve(SAMPLE, "nope").unwrap_err().to_string();
         assert!(error.contains("not found"), "{error}");
+    }
+
+    #[test]
+    fn points_at_the_unclosed_delimiter_instead_of_the_root_error() {
+        let truncated = "pub struct Client {\n    base: String,\n}\n\nimpl Client {\n    fn run(&self) {\n        eprintln!(\"[model] request (attempt {})";
+        let summary = first_error_summary(truncated);
+        assert!(summary.contains("never closed"), "{summary}");
+        assert!(!summary.starts_with("line 1, column 1"), "{summary}");
+    }
+
+    /// Regression: the exact truncated `new_code` that made the original
+    /// `OllamaClient` run fail. It must produce a precise message, not
+    /// `line 1, column 1: unexpected ERROR`.
+    #[test]
+    fn regression_summary_for_the_original_truncated_reply() {
+        let truncated = "pub struct LocalModelServerClient {\n    base: String,\n    model: String,\n    num_ctx: u32,\n    http: reqwest::Client,\n    verbose: bool,\n}\n\nimpl LocalModelServerClient {\n    pub fn new(model: String, num_ctx: u32, verbose: bool) -> Self {\n        let base = std::env::var(\"OLLAMA_HOST\")\n            .ok()\n            .map(|host| {\n                if host.starts_with(\"http://\") || host.starts_with(\"https://\") {\n                    host\n                } else {\n                    format!(\"http://{host}\")\n                }\n            })\n            .unwrap_or_else(|| \"http://127.0.0.1:11434\".to_string());\n        Self {\n            base: base.trim_end_matches('/').to_string(),\n            model,\n            num_ctx,\n            http: reqwest::Client::new(),\n            verbose,\n        }\n    }\n\n    pub async fn available_models(&self) -> Result<Vec<String>> {\n        let response = self\n            .http\n            .get(format!(\"{}/api/tags\", self.base))\n            .timeout(Duration::from_secs(15))\n            .send()\n            .await\n            .context(\"failed to reach Ollama; is `ollama serve` running?\")?;\n        let status = response.status();\n        let text = response\n            .text()\n            .await\n            .context(\"failed to read the Ollama model list\")?;\n        if !status.is_success() {\n            bail!(\"Ollama returned {status} for /api/tags: {text}\");\n        }\n        let parsed: TagsResponse =\n            serde_json::from_str(&text).context(\"invalid response from Ollama /api/tags\")?;\n        Ok(parsed.models.into_iter().map(|model| model.name).collect())\n    }\n\n    pub async fn ensure_model(&self) -> Result<()> {\n        let models = self.available_models().await?;\n        let wanted = &self.model;\n        let found = models.iter().any(|name| {\n            name == wanted\n                || (!wanted.contains(':') && name == &format!(\"{wanted}:latest\"))\n                || (!name.contains(':') && name == wanted)\n        });\n        if found {\n            return Ok(());\n        }\n        let available = if models.is_empty() {\n            \"(none)\".to_string()\n        } else {\n            models.join(\", \")\n        };\n        bail!(\n            \"model `{wanted}` is not available in Ollama.\\ninstalled: {available}\\nrun: ollama pull {wanted}\";\n        )\n    }\n}\n\n#[async_trait]\nimpl ModelClient for LocalModelServerClient {\n    async fn chat_json(\n        &self,\n        system: &str,\n        user: &str,\n        schema: Value,\n        options: ChatOptions,\n    ) -> Result<ModelReply> {\n        let start = Instant::now();\n        let mut messages = vec![\n            json!({\"role\": \"system\", \"content\": system}),\n            json!({\"role\": \"user\", \"content\": user}),\n        ];\n        let mut last_content = String::new();\n\n        for attempt in 0..2 {\n            let body = json!({\n                \"model\": self.model,\n                \"messages\": messages.clone(),\n                \"stream\": false,\n                \"format\": schema,\n                \"options\": {\n                    \"temperature\": options.temperature,\n                    \"num_ctx\": self.num_ctx,\n                    \"num_predict\": options.max_tokens,\n                    \"repeat_penalty\": 1.05,\n                    \"top_p\": 0.9,\n                }\n            });\n\n            if self.verbose {\n                eprintln!([model] request (attempt {})";
+        let problem = syntax_problem(truncated).unwrap();
+        assert!(problem.contains("never closed"), "{problem}");
+        assert!(!problem.starts_with("line 1, column 1"), "{problem}");
+    }
+
+    #[test]
+    fn flags_incomplete_replacements_but_accepts_complete_ones() {
+        assert_eq!(syntax_problem("pub fn a() -> u8 { 1 }"), None);
+        let problem = syntax_problem("pub fn a() -> u8 { 1").unwrap();
+        assert!(problem.contains("never closed"), "{problem}");
+    }
+
+    #[test]
+    fn renames_only_whole_identifiers() {
+        let source = "// OllamaClient lives here\nuse crate::model::OllamaClient;\n\npub struct OllamaClient {\n    base: String,\n}\n\nimpl OllamaClient {\n    fn name(&self) -> &str {\n        \"OllamaClient\"\n    }\n}\n";
+        let (updated, count) =
+            rename_occurrences(source, "OllamaClient", "LocalModelServerClient").unwrap();
+        assert_eq!(count, 3, "{updated}");
+        assert!(updated.contains("pub struct LocalModelServerClient"));
+        assert!(updated.contains("impl LocalModelServerClient"));
+        assert!(updated.contains("use crate::model::LocalModelServerClient;"));
+        assert!(updated.contains("// OllamaClient lives here"));
+        assert!(updated.contains("\"OllamaClient\""));
+        assert_eq!(error_count(&updated).unwrap(), 0);
     }
 }

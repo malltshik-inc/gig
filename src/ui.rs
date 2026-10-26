@@ -20,12 +20,15 @@ fn paint(text: &str, code: &str) -> String {
 pub fn banner() {
     println!(
         "{}\n{}",
-        paint("\
+        paint(
+            "\
 .d88b  888 .d88b
 8P www  8  8P www
 8b  d8  8  8b  d8
 `Y88P' 888 `Y88P'
-        ", "1;36"),
+        ",
+            "1;36"
+        ),
         paint(env!("CARGO_PKG_VERSION"), "2")
     );
 }
@@ -90,6 +93,14 @@ pub fn print_plan(plan: &Plan) {
             println!("  {line}");
         }
         println!();
+    }
+    for rename in &plan.renames {
+        println!(
+            "  {} {} -> {}",
+            paint("rename", "36"),
+            paint(&rename.from, "1"),
+            paint(&rename.to, "1")
+        );
     }
     for (index, file) in plan.files.iter().enumerate() {
         let action = if file.create { "create" } else { "edit" };

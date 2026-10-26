@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -10,6 +10,7 @@ use crate::detect;
 use crate::git;
 use crate::lang;
 use crate::model::OllamaClient;
+use crate::model::Rename;
 use crate::preflight;
 use crate::repomap;
 use crate::runlog::RunLog;
@@ -204,6 +205,10 @@ pub async fn run(cli: Cli, prompt: String) -> Result<i32> {
         ui::stage(&format!("edit attempt {attempt}/{max_attempts}"));
         let mut failure: Option<String> = None;
 
+        if let Some(summary) = apply_renames(&pf.root, &plan.renames, &mut snapshot)? {
+            ui::ok(&summary);
+        }
+
         'files: for file in &plan.files {
             let relative = Path::new(&file.path);
 
@@ -232,19 +237,34 @@ pub async fn run(cli: Cli, prompt: String) -> Result<i32> {
                     ));
                     break 'files;
                 }
-                let errors = lang::error_count(&edit.new_code)?;
+                if edit.truncated {
+                    failure = Some(format!(
+                        "the reply for the new file {} was cut off (the model hit the output limit); the file must be complete",
+                        file.path
+                    ));
+                    break 'files;
+                }
+                let content = apply_plan_renames(&edit.new_code, &plan.renames)?;
+                if let Some(problem) = lang::syntax_problem(&content) {
+                    failure = Some(format!(
+                        "the new file {} does not parse: {problem}",
+                        file.path
+                    ));
+                    break 'files;
+                }
+                let errors = lang::error_count(&content)?;
                 if errors > 0 {
                     failure = Some(format!(
                         "the new file {} does not parse: {}",
                         file.path,
-                        lang::first_error_summary(&edit.new_code)
+                        lang::first_error_summary(&content)
                     ));
                     break 'files;
                 }
                 format_clean.entry(file.path.clone()).or_insert(true);
                 snapshot.record(relative)?;
-                write_file(&pf.root, relative, &edit.new_code)?;
-                previous.insert(format!("{}::<file>", file.path), edit.new_code.clone());
+                write_file(&pf.root, relative, &content)?;
+                previous.insert(format!("{}::<file>", file.path), content.clone());
                 ui::ok(&format!("created {}", file.path));
 
                 if let Some(declaration) = lang::module_declaration(&pf.root, relative) {
@@ -316,6 +336,20 @@ pub async fn run(cli: Cli, prompt: String) -> Result<i32> {
                     failure = Some(format!(
                         "the editor gave up on {}::{}: {}",
                         file.path, symbol, edit.thought
+                    ));
+                    break 'files;
+                }
+                if edit.truncated {
+                    failure = Some(format!(
+                        "the replacement for `{}` was cut off (the model hit the output limit); it must contain the complete symbol.",
+                        resolved.qualified
+                    ));
+                    break 'files;
+                }
+                if let Some(problem) = lang::syntax_problem(&edit.new_code) {
+                    failure = Some(format!(
+                        "the replacement for `{}` does not parse on its own: {problem}",
+                        resolved.qualified
                     ));
                     break 'files;
                 }
@@ -483,6 +517,112 @@ fn write_file(root: &Path, relative: &Path, content: &str) -> Result<()> {
     }
     std::fs::write(&absolute, content)
         .with_context(|| format!("failed to write {}", absolute.display()))
+}
+
+/// Apply the plan's deterministic renames to one block of code (used for
+/// newly created files, which the rename pass has not seen yet).
+fn apply_plan_renames(code: &str, renames: &[Rename]) -> Result<String> {
+    let mut content = code.to_string();
+    for rename in renames {
+        content = lang::rename_occurrences(&content, &rename.from, &rename.to)?.0;
+    }
+    Ok(content)
+}
+
+/// Rewrite every occurrence of each planned rename in every `.rs` file under
+/// `root`. Files already on the snapshot are skipped; the rest are recorded
+/// before their first write so a failed attempt rolls back cleanly.
+fn apply_renames(
+    root: &Path,
+    renames: &[Rename],
+    snapshot: &mut Snapshot,
+) -> Result<Option<String>> {
+    if renames.is_empty() {
+        return Ok(None);
+    }
+    let mut touched = Vec::new();
+    for relative in rust_files(root) {
+        let absolute = root.join(&relative);
+        let source = match std::fs::read_to_string(&absolute) {
+            Ok(source) => source,
+            Err(error) => {
+                ui::warn(&format!("skipping {}: {error:#}", relative.display()));
+                continue;
+            }
+        };
+        let mut content = source.clone();
+        let mut count = 0usize;
+        for rename in renames {
+            match lang::rename_occurrences(&content, &rename.from, &rename.to) {
+                Ok((next, replaced)) => {
+                    count += replaced;
+                    content = next;
+                }
+                Err(error) => {
+                    ui::warn(&format!(
+                        "skipping {} for rename `{}`: {error:#}",
+                        relative.display(),
+                        rename.from
+                    ));
+                }
+            }
+        }
+        if count == 0 {
+            continue;
+        }
+        snapshot.record(&relative)?;
+        write_file(root, &relative, &content)?;
+        touched.push(relative.clone());
+    }
+    if touched.is_empty() {
+        return Ok(None);
+    }
+    let names = touched
+        .iter()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(Some(format!("renamed symbols in {names}")))
+}
+
+/// Every `.rs` file under `root`, sorted for determinism, skipping `target/`.
+fn rust_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .max_filesize(Some(1_000_000))
+        .build();
+    for result in walker {
+        let entry = match result {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        if !entry
+            .file_type()
+            .map(|kind| kind.is_file())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+        let relative = match path.strip_prefix(root) {
+            Ok(relative) => relative.to_path_buf(),
+            Err(_) => continue,
+        };
+        let normalized = relative.to_string_lossy().replace('\\', "/");
+        if normalized.starts_with("target/") || normalized.contains("/target/") {
+            continue;
+        }
+        files.push(relative);
+    }
+    files.sort();
+    files
 }
 
 fn file_context(source: &str, symbol_start: usize) -> String {
@@ -655,5 +795,85 @@ mod tests {
         assert_eq!(resolve_mode(true, true, false), (RunMode::Plan, true));
         assert_eq!(resolve_mode(true, false, false), (RunMode::Plan, false));
         assert_eq!(resolve_mode(true, false, true), (RunMode::Plan, false));
+    }
+
+    #[test]
+    fn applies_renames_to_all_rust_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/model.rs"),
+            "pub struct OllamaClient { base: String }\nimpl OllamaClient {\n    fn new() -> Self { Self { base: String::new() } }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "use crate::model::OllamaClient;\npub fn make() -> OllamaClient { OllamaClient { base: String::new() } }\n",
+        )
+        .unwrap();
+        // Generated artifacts must be skipped.
+        std::fs::create_dir_all(dir.path().join("target/debug")).unwrap();
+        std::fs::write(
+            dir.path().join("target/debug/gen.rs"),
+            "pub struct OllamaClient {}\n",
+        )
+        .unwrap();
+
+        let renames = vec![Rename {
+            from: "OllamaClient".to_string(),
+            to: "LocalModelServerClient".to_string(),
+        }];
+        let mut snapshot = Snapshot::new(dir.path());
+        let summary = apply_renames(dir.path(), &renames, &mut snapshot)
+            .unwrap()
+            .unwrap();
+
+        assert!(summary.contains("src/lib.rs"), "{summary}");
+        assert!(summary.contains("src/model.rs"), "{summary}");
+        assert!(!summary.contains("target/debug/gen.rs"), "{summary}");
+
+        let model = std::fs::read_to_string(dir.path().join("src/model.rs")).unwrap();
+        assert!(model.contains("pub struct LocalModelServerClient"));
+        assert!(model.contains("impl LocalModelServerClient"));
+        assert!(!model.contains("OllamaClient"));
+
+        let lib = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap();
+        assert!(lib.contains("use crate::model::LocalModelServerClient;"));
+        assert!(lib.contains("LocalModelServerClient { base:"));
+        assert!(!lib.contains("OllamaClient"));
+
+        let generated = std::fs::read_to_string(dir.path().join("target/debug/gen.rs")).unwrap();
+        assert!(generated.contains("OllamaClient"));
+
+        // The snapshot records the renamed files so rollback restores them.
+        let touched = snapshot.touched();
+        assert!(touched.contains(&PathBuf::from("src/lib.rs")));
+        assert!(touched.contains(&PathBuf::from("src/model.rs")));
+    }
+
+    #[test]
+    fn rename_pass_is_a_noop_without_renames() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            apply_renames(dir.path(), &[], &mut Snapshot::new(dir.path()))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn applies_renames_to_new_files() {
+        let code = "pub struct OllamaClient { base: String }\nimpl OllamaClient {\n    fn new() -> Self { Self { base: String::new() } }\n}\n";
+        let renamed = apply_plan_renames(
+            code,
+            &[Rename {
+                from: "OllamaClient".to_string(),
+                to: "LocalModelServerClient".to_string(),
+            }],
+        )
+        .unwrap();
+        assert!(renamed.contains("pub struct LocalModelServerClient"));
+        assert!(renamed.contains("impl LocalModelServerClient"));
+        assert_eq!(lang::error_count(&renamed).unwrap(), 0);
     }
 }
